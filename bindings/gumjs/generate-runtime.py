@@ -17,7 +17,7 @@ RELAXED_DEPS = {
 
 EXACT_DEPS = {
     "frida-java-bridge": "6.2.2",
-    "frida-objc-bridge": "7.0.2",
+    "frida-objc-bridge": "git+https://github.com/Lessica/frida-objc-bridge#36e464eba67012c225ce4f010ab801018bcae8be",
     "frida-swift-bridge": "2.0.6"
 }
 
@@ -44,7 +44,13 @@ def generate_runtime(arch, endian, input_dir, gum_dir, capstone_incdir, libtcc_i
                            capture_output=True,
                            cwd=output_dir,
                            check=True)
-            subprocess.run([npm, "install", "-E"] + [f"{name}@{version_spec}" for name, version_spec in EXACT_DEPS.items()],
+            subprocess.run([npm, "install", "-E"] + [
+                f"{name}@{version_spec}" for name, version_spec in EXACT_DEPS.items() if not version_spec.startswith("git+")],
+                           capture_output=True,
+                           cwd=output_dir,
+                           check=True)
+            subprocess.run([npm, "install", "-E"] + [
+                f"{version_spec}" for version_spec in EXACT_DEPS.values() if version_spec.startswith("git+")],
                            capture_output=True,
                            cwd=output_dir,
                            check=True)
