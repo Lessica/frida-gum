@@ -33,8 +33,31 @@
 # include "gumv8database.h"
 #endif
 
-typedef guint GumScriptState;
+#include <v8-inspector.h>
+
+enum GumScriptState
+{
+  GUM_SCRIPT_STATE_CREATED,
+  GUM_SCRIPT_STATE_LOADING,
+  GUM_SCRIPT_STATE_LOADED,
+  GUM_SCRIPT_STATE_UNLOADING,
+  GUM_SCRIPT_STATE_UNLOADED
+};
+
+enum GumV8InspectorState
+{
+  GUM_V8_RUNNING,
+  GUM_V8_DEBUGGING,
+  GUM_V8_PAUSED
+};
+
 struct GumESProgram;
+
+class GumInspectorClient;
+class GumInspectorChannel;
+
+typedef std::map<guint, std::unique_ptr<GumInspectorChannel>>
+    GumInspectorChannelMap;
 
 struct _GumV8Script
 {
@@ -42,6 +65,9 @@ struct _GumV8Script
 
   gchar * name;
   gchar * source;
+  GBytes * snapshot;
+  v8::StartupData * snapshot_blob;
+  v8::StartupData snapshot_blob_storage;
   GMainContext * main_context;
   GumV8ScriptBackend * backend;
 
@@ -69,12 +95,28 @@ struct _GumV8Script
   GumV8CodeWriter code_writer;
   GumV8CodeRelocator code_relocator;
   GumV8Stalker stalker;
-  GumPersistent<v8::Context>::type * context;
+  v8::Global<v8::Context> * context;
   GumESProgram * program;
 
   GumScriptMessageHandler message_handler;
   gpointer message_handler_data;
   GDestroyNotify message_handler_data_destroy;
+
+  GMutex inspector_mutex;
+  GCond inspector_cond;
+  volatile GumV8InspectorState inspector_state;
+  int context_group_id;
+
+  GumScriptDebugMessageHandler debug_handler;
+  gpointer debug_handler_data;
+  GDestroyNotify debug_handler_data_destroy;
+  GMainContext * debug_handler_context;
+  GQueue debug_messages;
+  volatile bool flush_scheduled;
+
+  v8_inspector::V8Inspector * inspector;
+  GumInspectorClient * inspector_client;
+  GumInspectorChannelMap * channels;
 };
 
 struct GumESProgram
@@ -84,7 +126,7 @@ struct GumESProgram
   GHashTable * es_modules;
 
   gchar * global_filename;
-  GumPersistent<v8::Script>::type * global_code;
+  v8::Global<v8::Script> * global_code;
 };
 
 struct GumESAsset
@@ -96,7 +138,12 @@ struct GumESAsset
   gpointer data;
   gsize data_size;
 
-  GumPersistent<v8::Module>::type * module;
+  v8::Global<v8::Module> * module;
 };
+
+G_GNUC_INTERNAL v8::MaybeLocal<v8::Module> _gum_v8_script_load_module (
+    GumV8Script * self, const gchar * name, const gchar * source);
+G_GNUC_INTERNAL void _gum_v8_script_register_source_map (GumV8Script * self,
+    const gchar * name, gchar * source_map);
 
 #endif

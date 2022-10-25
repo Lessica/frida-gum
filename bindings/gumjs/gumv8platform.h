@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015-2021 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2015-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -13,7 +13,7 @@
 #include <functional>
 #include <map>
 #include <unordered_set>
-#include <v8/v8-platform.h>
+#include <v8-platform.h>
 
 class GumV8Operation;
 class GumV8MainContextOperation;
@@ -30,21 +30,9 @@ public:
   GumV8Platform & operator= (const GumV8Platform &) = delete;
   ~GumV8Platform ();
 
-  v8::Isolate * GetIsolate () const { return shared_isolate; }
-  GumV8Bundle * GetRuntimeBundle () const { return runtime_bundle; }
-  const gchar * GetRuntimeSourceMap () const;
-#ifdef HAVE_OBJC_BRIDGE
-  GumV8Bundle * GetObjCBundle ();
-  const gchar * GetObjCSourceMap () const;
-#endif
-#ifdef HAVE_SWIFT_BRIDGE
-  GumV8Bundle * GetSwiftBundle ();
-  const gchar * GetSwiftSourceMap () const;
-#endif
-#ifdef HAVE_JAVA_BRIDGE
-  GumV8Bundle * GetJavaBundle ();
-  const gchar * GetJavaSourceMap () const;
-#endif
+  void DisposeIsolate (v8::Isolate ** isolate);
+  void ForgetIsolate (v8::Isolate * isolate);
+
   GumScriptScheduler * GetScheduler () const { return scheduler; }
   std::shared_ptr<GumV8Operation> ScheduleOnJSThread (std::function<void ()> f);
   std::shared_ptr<GumV8Operation> ScheduleOnJSThread (gint priority,
@@ -68,18 +56,23 @@ public:
   void CallDelayedOnWorkerThread (std::unique_ptr<v8::Task> task,
       double delay_in_seconds) override;
   bool IdleTasksEnabled (v8::Isolate * isolate) override;
-  std::unique_ptr<v8::JobHandle> PostJob (v8::TaskPriority priority,
+  std::unique_ptr<v8::JobHandle> CreateJob (v8::TaskPriority priority,
       std::unique_ptr<v8::JobTask> job_task) override;
   double MonotonicallyIncreasingTime () override;
   double CurrentClockTimeMillis () override;
   v8::ThreadingBackend * GetThreadingBackend () override;
   v8::TracingController * GetTracingController () override;
 
+  v8::ArrayBuffer::Allocator * GetArrayBufferAllocator () const;
+
 private:
   void InitRuntime ();
   void Dispose ();
   void CancelPendingOperations ();
-  static void OnFatalError (const char * location, const char * message);
+  void MaybeDisposeIsolate (v8::Isolate * isolate);
+  std::unordered_set<std::shared_ptr<GumV8Operation>> GetPendingOperationsFor (
+      v8::Isolate * isolate);
+  void OnOperationRemoved (GumV8Operation * op);
 
   static gboolean PerformMainContextOperation (gpointer data);
   static void ReleaseMainContextOperation (gpointer data);
@@ -91,7 +84,7 @@ private:
   static void ReleaseDelayedThreadPoolOperation (gpointer data);
 
   GMutex mutex;
-  v8::Isolate * shared_isolate;
+  bool disposing;
   GumV8Bundle * runtime_bundle;
 #ifdef HAVE_OBJC_BRIDGE
   GumV8Bundle * objc_bundle;
@@ -103,6 +96,7 @@ private:
   GumV8Bundle * java_bundle;
 #endif
   GumScriptScheduler * scheduler;
+  std::unordered_set<v8::Isolate *> dying_isolates;
   std::unordered_set<std::shared_ptr<GumV8Operation>> js_ops;
   std::unordered_set<std::shared_ptr<GumV8Operation>> pool_ops;
   std::map<v8::Isolate *, std::shared_ptr<v8::TaskRunner>> foreground_runners;
@@ -121,13 +115,21 @@ private:
 class GumV8Operation
 {
 public:
-  GumV8Operation () = default;
+  GumV8Operation ();
   GumV8Operation (const GumV8Operation &) = delete;
   GumV8Operation & operator= (const GumV8Operation &) = delete;
   virtual ~GumV8Operation () = default;
 
+  void AnchorTo (v8::Isolate * i);
+  bool IsAnchoredTo (v8::Isolate * i) const;
+
   virtual void Cancel () = 0;
   virtual void Await () = 0;
+
+private:
+  v8::Isolate * isolate;
+
+  friend class GumV8Platform;
 };
 
 #endif

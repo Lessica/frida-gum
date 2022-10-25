@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015-2021 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2015-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -7,21 +7,15 @@
 #include "gumv8platform.h"
 
 #include "gumscriptbackend.h"
-#include "gumv8script-runtime.h"
-#ifdef HAVE_OBJC_BRIDGE
-# include "gumv8script-objc.h"
-#endif
-#ifdef HAVE_SWIFT_BRIDGE
-# include "gumv8script-swift.h"
-#endif
-#ifdef HAVE_JAVA_BRIDGE
-# include "gumv8script-java.h"
-#endif
 
 #include <algorithm>
 #include <gum/gumcloak.h>
 #include <gum/gumcodesegment.h>
 #include <gum/gummemory.h>
+#ifdef HAVE_DARWIN
+# include <mach/mach.h>
+# include <sys/mman.h>
+#endif
 
 using namespace v8;
 
@@ -37,7 +31,8 @@ class GumV8MainContextOperation : public GumV8Operation
 {
 public:
   GumV8MainContextOperation (GumV8Platform * platform,
-      std::function<void ()> func, GSource * source);
+      std::function<void ()> func, GSource * source,
+      guint delay_in_milliseconds);
   ~GumV8MainContextOperation () override;
 
   void Perform ();
@@ -57,6 +52,7 @@ private:
   GumV8Platform * platform;
   std::function<void ()> func;
   GSource * source;
+  guint delay_in_milliseconds;
   volatile State state;
   GCond cond;
 
@@ -180,7 +176,7 @@ public:
   {
   public:
     explicit JobDelegate (GumV8JobState * parent, bool is_joining_thread);
-    ~JobDelegate ();
+    virtual ~JobDelegate ();
 
     void NotifyConcurrencyIncrease () override;
     bool ShouldYield () override;
@@ -197,6 +193,7 @@ public:
 
 private:
   GMutex mutex;
+  Isolate * isolate;
   GumV8Platform * platform;
   std::unique_ptr<JobTask> job_task;
   TaskPriority priority;
@@ -220,9 +217,7 @@ public:
   void Join () override;
   void Cancel () override;
   void CancelAndDetach () override;
-  bool IsCompleted () override { return !IsActive (); }
   bool IsActive () override;
-  bool IsRunning () override { return IsValid (); }
   bool IsValid () override { return state != nullptr; }
   bool UpdatePriorityEnabled () const override { return true; }
   void UpdatePriority (TaskPriority new_priority) override;
@@ -261,6 +256,10 @@ public:
   bool ReleasePages (void * address, size_t length, size_t new_length) override;
   bool SetPermissions (void * address, size_t length,
       Permission permissions) override;
+  bool RecommitPages (void * address, size_t length, Permission permissions)
+      override;
+  bool DiscardSystemPages (void * address, size_t size) override;
+  bool DecommitPages (void * address, size_t size) override;
 };
 
 class GumV8ArrayBufferAllocator : public ArrayBuffer::Allocator
@@ -437,16 +436,7 @@ private:
 };
 
 GumV8Platform::GumV8Platform ()
-  :
-#ifdef HAVE_OBJC_BRIDGE
-    objc_bundle (NULL),
-#endif
-#ifdef HAVE_SWIFT_BRIDGE
-    swift_bundle (NULL),
-#endif
-#ifdef HAVE_JAVA_BRIDGE
-    java_bundle (NULL),
-#endif
+  : disposing (false),
     scheduler (gum_script_backend_get_scheduler ()),
     page_allocator (new GumV8PageAllocator ()),
     array_buffer_allocator (new GumV8ArrayBufferAllocator ()),
@@ -459,15 +449,6 @@ GumV8Platform::GumV8Platform ()
 
   V8::InitializePlatform (this);
   V8::Initialize ();
-
-  Isolate::CreateParams params;
-  params.array_buffer_allocator = array_buffer_allocator.get ();
-
-  shared_isolate = Isolate::New (params);
-  shared_isolate->SetFatalErrorHandler (OnFatalError);
-  shared_isolate->SetMicrotasksPolicy (MicrotasksPolicy::kExplicit);
-
-  InitRuntime ();
 }
 
 GumV8Platform::~GumV8Platform ()
@@ -480,46 +461,18 @@ GumV8Platform::~GumV8Platform ()
 }
 
 void
-GumV8Platform::InitRuntime ()
-{
-  Locker locker (shared_isolate);
-  Isolate::Scope isolate_scope (shared_isolate);
-  HandleScope handle_scope (shared_isolate);
-  Local<Context> context (Context::New (shared_isolate));
-  Context::Scope context_scope (context);
-
-  runtime_bundle = gum_v8_bundle_new (shared_isolate, gumjs_runtime_modules);
-}
-
-void
 GumV8Platform::Dispose ()
 {
-  CancelPendingOperations ();
-
-  {
-    Locker locker (shared_isolate);
-    Isolate::Scope isolate_scope (shared_isolate);
-    HandleScope handle_scope (shared_isolate);
-
-#ifdef HAVE_OBJC_BRIDGE
-    g_clear_pointer (&objc_bundle, gum_v8_bundle_free);
-#endif
-#ifdef HAVE_SWIFT_BRIDGE
-    g_clear_pointer (&swift_bundle, gum_v8_bundle_free);
-#endif
-#ifdef HAVE_JAVA_BRIDGE
-    g_clear_pointer (&java_bundle, gum_v8_bundle_free);
-#endif
-
-    g_clear_pointer (&runtime_bundle, gum_v8_bundle_free);
-  }
-
-  shared_isolate->Dispose ();
+  disposing = true;
 
   CancelPendingOperations ();
+
+  for (const auto & isolate : dying_isolates)
+    isolate->Dispose ();
+  dying_isolates.clear ();
 
   V8::Dispose ();
-  V8::ShutdownPlatform ();
+  V8::DisposePlatform ();
 }
 
 void
@@ -546,9 +499,11 @@ GumV8Platform::CancelPendingOperations ()
     for (const auto & op : pool_ops_copy)
       op->Await ();
 
-    GumV8PlatformLocker locker (this);
-    if (js_ops.empty () && pool_ops.empty ())
-      break;
+    {
+      GumV8PlatformLocker locker (this);
+      if (js_ops.empty () && pool_ops.empty ())
+        break;
+    }
 
     bool anything_pending = false;
     while (g_main_context_pending (main_context))
@@ -562,71 +517,105 @@ GumV8Platform::CancelPendingOperations ()
 }
 
 void
-GumV8Platform::OnFatalError (const char * location,
-                             const char * message)
+GumV8Platform::DisposeIsolate (Isolate ** isolate)
 {
-  g_log ("V8", G_LOG_LEVEL_ERROR, "%s: %s", location, message);
+  Isolate * i = (Isolate *) g_steal_pointer (isolate);
+
+  {
+    GumV8PlatformLocker locker (this);
+    dying_isolates.insert (i);
+  }
+
+  MaybeDisposeIsolate (i);
 }
 
-const gchar *
-GumV8Platform::GetRuntimeSourceMap () const
+void
+GumV8Platform::MaybeDisposeIsolate (Isolate * isolate)
 {
-  return gumjs_frida_source_map;
+  auto isolate_ops = GetPendingOperationsFor (isolate);
+  for (const auto & op : isolate_ops)
+    op->Cancel ();
+  if (!isolate_ops.empty ())
+    return;
+
+  {
+    GumV8PlatformLocker locker (this);
+
+    if (disposing || dying_isolates.find (isolate) == dying_isolates.end ())
+      return;
+
+    foreground_runners.erase (isolate);
+    dying_isolates.erase (isolate);
+  }
+
+  isolate->Dispose ();
 }
 
-#ifdef HAVE_OBJC_BRIDGE
-
-GumV8Bundle *
-GumV8Platform::GetObjCBundle ()
+void
+GumV8Platform::ForgetIsolate (Isolate * isolate)
 {
-  if (objc_bundle == NULL)
-    objc_bundle = gum_v8_bundle_new (shared_isolate, gumjs_objc_modules);
-  return objc_bundle;
+  std::unordered_set<std::shared_ptr<GumV8Operation>> isolate_ops;
+  do
+  {
+    isolate_ops = GetPendingOperationsFor (isolate);
+
+    for (const auto & op : isolate_ops)
+      op->Cancel ();
+    for (const auto & op : isolate_ops)
+      op->Await ();
+  }
+  while (!isolate_ops.empty ());
+
+  {
+    GumV8PlatformLocker locker (this);
+
+    foreground_runners.erase (isolate);
+  }
 }
 
-const gchar *
-GumV8Platform::GetObjCSourceMap () const
+std::unordered_set<std::shared_ptr<GumV8Operation>>
+GumV8Platform::GetPendingOperationsFor (Isolate * isolate)
 {
-  return gumjs_objc_source_map;
+  std::unordered_set<std::shared_ptr<GumV8Operation>> isolate_ops;
+
+  GumV8PlatformLocker locker (this);
+
+  for (const auto & op : js_ops)
+  {
+    if (op->IsAnchoredTo (isolate))
+      isolate_ops.insert (op);
+  }
+
+  for (const auto & op : pool_ops)
+  {
+    if (op->IsAnchoredTo (isolate))
+      isolate_ops.insert (op);
+  }
+
+  return isolate_ops;
 }
 
-#endif
-
-#ifdef HAVE_SWIFT_BRIDGE
-
-GumV8Bundle *
-GumV8Platform::GetSwiftBundle ()
+void
+GumV8Platform::OnOperationRemoved (GumV8Operation * op)
 {
-  if (swift_bundle == NULL)
-    swift_bundle = gum_v8_bundle_new (shared_isolate, gumjs_swift_modules);
-  return swift_bundle;
+  Isolate * isolate = op->isolate;
+  if (isolate == nullptr)
+    return;
+
+  {
+    GumV8PlatformLocker locker (this);
+    if (dying_isolates.find (isolate) == dying_isolates.end ())
+      return;
+  }
+
+  if (g_main_context_is_owner (gum_script_scheduler_get_js_context (scheduler)))
+    MaybeDisposeIsolate (isolate);
+  else
+    ScheduleOnJSThread (G_PRIORITY_HIGH, [=]()
+        {
+          MaybeDisposeIsolate (isolate);
+        });
 }
-
-const gchar *
-GumV8Platform::GetSwiftSourceMap () const
-{
-  return gumjs_swift_source_map;
-}
-
-#endif
-
-#ifdef HAVE_JAVA_BRIDGE
-
-GumV8Bundle *
-GumV8Platform::GetJavaBundle ()
-{
-  if (java_bundle == NULL)
-    java_bundle = gum_v8_bundle_new (shared_isolate, gumjs_java_modules);
-  return java_bundle;
-}
-
-const gchar *
-GumV8Platform::GetJavaSourceMap () const
-{
-  return gumjs_java_source_map;
-}
-
-#endif
 
 std::shared_ptr<GumV8Operation>
 GumV8Platform::ScheduleOnJSThread (std::function<void ()> f)
@@ -659,7 +648,8 @@ GumV8Platform::ScheduleOnJSThreadDelayed (guint delay_in_milliseconds,
       : g_idle_source_new ();
   g_source_set_priority (source, priority);
 
-  auto op = std::make_shared<GumV8MainContextOperation> (this, f, source);
+  auto op = std::make_shared<GumV8MainContextOperation> (this, f, source,
+      delay_in_milliseconds);
 
   {
     GumV8PlatformLocker locker (this);
@@ -687,7 +677,7 @@ GumV8Platform::PerformOnJSThread (gint priority,
   GSource * source = g_idle_source_new ();
   g_source_set_priority (source, priority);
 
-  auto op = std::make_shared<GumV8MainContextOperation> (this, f, source);
+  auto op = std::make_shared<GumV8MainContextOperation> (this, f, source, 0);
 
   g_source_set_callback (source, PerformMainContextOperation,
       new std::shared_ptr<GumV8MainContextOperation> (op),
@@ -760,6 +750,8 @@ GumV8Platform::ReleaseMainContextOperation (gpointer data)
     platform->js_ops.erase (op);
   }
 
+  platform->OnOperationRemoved (op.get ());
+
   delete ptr;
 }
 
@@ -791,6 +783,8 @@ GumV8Platform::ReleaseThreadPoolOperation (gpointer data)
 
     platform->pool_ops.erase (op);
   }
+
+  platform->OnOperationRemoved (op.get ());
 
   delete ptr;
 }
@@ -824,6 +818,7 @@ GumV8Platform::ReleaseDelayedThreadPoolOperation (gpointer data)
 
   auto op = *ptr;
   auto platform = op->platform;
+  bool removed = false;
   {
     GumV8PlatformLocker locker (platform);
 
@@ -836,9 +831,13 @@ GumV8Platform::ReleaseDelayedThreadPoolOperation (gpointer data)
       case GumV8DelayedThreadPoolOperation::kCanceling:
       case GumV8DelayedThreadPoolOperation::kCanceled:
         platform->pool_ops.erase (op);
+        removed = true;
         break;
     }
   }
+
+  if (removed)
+    platform->OnOperationRemoved (op.get ());
 
   delete ptr;
 }
@@ -858,6 +857,8 @@ GumV8Platform::NumberOfWorkerThreads ()
 std::shared_ptr<TaskRunner>
 GumV8Platform::GetForegroundTaskRunner (Isolate * isolate)
 {
+  GumV8PlatformLocker locker (this);
+
   auto runner = foreground_runners[isolate];
   if (!runner)
   {
@@ -893,8 +894,8 @@ GumV8Platform::IdleTasksEnabled (Isolate * isolate)
 }
 
 std::unique_ptr<JobHandle>
-GumV8Platform::PostJob (TaskPriority priority,
-                        std::unique_ptr<JobTask> job_task)
+GumV8Platform::CreateJob (TaskPriority priority,
+                          std::unique_ptr<JobTask> job_task)
 {
   size_t num_worker_threads = NumberOfWorkerThreads ();
   if (priority == TaskPriority::kBestEffort)
@@ -936,13 +937,38 @@ GumV8Platform::GetTracingController ()
   return tracing_controller.get ();
 }
 
+ArrayBuffer::Allocator *
+GumV8Platform::GetArrayBufferAllocator () const
+{
+  return array_buffer_allocator.get ();
+}
+
+GumV8Operation::GumV8Operation ()
+  : isolate (Isolate::TryGetCurrent ())
+{
+}
+
+void
+GumV8Operation::AnchorTo (v8::Isolate * i)
+{
+  isolate = i;
+}
+
+bool
+GumV8Operation::IsAnchoredTo (Isolate * i) const
+{
+  return isolate == i;
+}
+
 GumV8MainContextOperation::GumV8MainContextOperation (
     GumV8Platform * platform,
     std::function<void ()> func,
-    GSource * source)
+    GSource * source,
+    guint delay_in_milliseconds)
   : platform (platform),
     func (func),
     source (source),
+    delay_in_milliseconds (delay_in_milliseconds),
     state (kScheduled)
 {
   g_cond_init (&cond);
@@ -976,6 +1002,9 @@ GumV8MainContextOperation::Perform ()
 void
 GumV8MainContextOperation::Cancel ()
 {
+  if (delay_in_milliseconds == 0)
+    return;
+
   {
     GumV8PlatformLocker locker (platform);
     if (state != kScheduled)
@@ -1037,11 +1066,6 @@ GumV8ThreadPoolOperation::Perform ()
 void
 GumV8ThreadPoolOperation::Cancel ()
 {
-  GumV8PlatformLocker locker (platform);
-  if (state != kScheduled)
-    return;
-  state = kCanceled;
-  g_cond_signal (&cond);
 }
 
 void
@@ -1218,7 +1242,8 @@ GumV8JobState::GumV8JobState (GumV8Platform * platform,
                               std::unique_ptr<JobTask> job_task,
                               TaskPriority priority,
                               size_t num_worker_threads)
-  : platform (platform),
+  : isolate (Isolate::GetCurrent ()),
+    platform (platform),
     job_task (std::move (job_task)),
     priority (priority),
     num_worker_threads (std::min (num_worker_threads, kMaxWorkerPerJob))
@@ -1437,7 +1462,12 @@ GumV8JobState::CallOnWorkerThread (TaskPriority with_priority,
                                    std::unique_ptr<Task> task)
 {
   std::shared_ptr<Task> t (std::move (task));
-  platform->ScheduleOnThreadPool ([=]() { t->Run (); });
+  auto op = platform->ScheduleOnThreadPool ([=]() { t->Run (); });
+
+  {
+    GumV8PlatformLocker locker (platform);
+    op->AnchorTo (isolate);
+  }
 }
 
 GumV8JobState::JobDelegate::JobDelegate (GumV8JobState * parent,
@@ -1476,7 +1506,6 @@ GumV8JobState::JobDelegate::GetTaskId ()
 GumV8JobHandle::GumV8JobHandle (std::shared_ptr<GumV8JobState> state)
   : state (std::move (state))
 {
-  this->state->NotifyConcurrencyIncrease ();
 }
 
 GumV8JobHandle::~GumV8JobHandle ()
@@ -1579,8 +1608,25 @@ GumV8PageAllocator::AllocatePages (void * address,
 {
   GumV8InterceptorIgnoreScope interceptor_ignore_scope;
 
-  gpointer base = gum_memory_allocate (NULL, length, alignment,
-      gum_page_protection_from_v8 (permissions));
+  gpointer base;
+#ifdef HAVE_DARWIN
+  if (permissions == PageAllocator::kNoAccessWillJitLater)
+  {
+    g_assert (alignment == gum_query_page_size ());
+
+    base = mmap (address, length, PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, VM_MAKE_TAG (255), 0);
+    if (base == MAP_FAILED)
+      base = NULL;
+  }
+  else
+#endif
+  {
+    base = gum_memory_allocate (address, length, alignment,
+        gum_page_protection_from_v8 (permissions));
+  }
+  if (base == NULL)
+    return nullptr;
 
   GumMemoryRange range;
   range.base_address = GPOINTER_TO_SIZE (base);
@@ -1638,8 +1684,13 @@ GumV8PageAllocator::SetPermissions (void * address,
 
   GumPageProtection prot = gum_page_protection_from_v8 (permissions);
 
-#ifndef HAVE_WINDOWS
   gboolean success;
+#if defined (HAVE_WINDOWS)
+  if (permissions == PageAllocator::kNoAccess)
+    success = gum_memory_decommit (address, length);
+  else
+    success = gum_memory_recommit (address, length, prot);
+#elif defined (HAVE_DARWIN)
   if (permissions == PageAllocator::kReadExecute &&
       gum_code_segment_is_supported ())
   {
@@ -1647,18 +1698,83 @@ GumV8PageAllocator::SetPermissions (void * address,
   }
   else
   {
-    success = gum_try_mprotect (address, length, prot);
+    int bsd_prot = 0;
+    switch (permissions)
+    {
+      case PageAllocator::kNoAccess:
+      case PageAllocator::kNoAccessWillJitLater:
+        bsd_prot = PROT_NONE;
+        break;
+      case PageAllocator::kRead:
+        bsd_prot = PROT_READ;
+        break;
+      case PageAllocator::kReadWrite:
+        bsd_prot = PROT_READ | PROT_WRITE;
+        break;
+      case PageAllocator::kReadWriteExecute:
+        bsd_prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+        break;
+      case PageAllocator::kReadExecute:
+        bsd_prot = PROT_READ | PROT_EXEC;
+        break;
+      default:
+        g_assert_not_reached ();
+    }
+
+    success = mprotect (address, length, bsd_prot) == 0;
+
+    if (!success && permissions == PageAllocator::kNoAccess)
+    {
+      /*
+       * XNU refuses to transition from ReadWriteExecute to NoAccess, so do what
+       * the default v8::PageAllocator does and just discard the pages.
+       */
+      return gum_memory_discard (address, length) != FALSE;
+    }
   }
-  if (!success)
-    return false;
+
+  if (success && permissions == PageAllocator::kNoAccess)
+    gum_memory_discard (address, length);
+
+  if (permissions != PageAllocator::kNoAccess)
+    gum_memory_recommit (address, length, prot);
+#else
+  success = gum_try_mprotect (address, length, prot);
+
+  if (success && permissions == PageAllocator::kNoAccess)
+    gum_memory_discard (address, length);
 #endif
 
-  if (permissions == PageAllocator::kNoAccess)
-    gum_memory_decommit (address, length);
-  else
-    gum_memory_commit (address, length, prot);
+  return success != FALSE;
+}
 
-  return true;
+bool
+GumV8PageAllocator::RecommitPages (void * address,
+                                   size_t length,
+                                   Permission permissions)
+{
+  GumV8InterceptorIgnoreScope interceptor_ignore_scope;
+
+  return gum_memory_recommit (address, length,
+      gum_page_protection_from_v8 (permissions)) != FALSE;
+}
+
+bool
+GumV8PageAllocator::DiscardSystemPages (void * address,
+                                        size_t size)
+{
+  GumV8InterceptorIgnoreScope interceptor_ignore_scope;
+
+  return gum_memory_discard (address, size) != FALSE;
+}
+
+bool
+GumV8PageAllocator::DecommitPages (void * address,
+                                   size_t size)
+{
+  GumV8InterceptorIgnoreScope interceptor_ignore_scope;
+
+  return gum_memory_decommit (address, size) != FALSE;
 }
 
 void *
@@ -1858,15 +1974,16 @@ gum_page_protection_from_v8 (PageAllocator::Permission permission)
   switch (permission)
   {
     case PageAllocator::kNoAccess:
+    case PageAllocator::kNoAccessWillJitLater:
       return GUM_PAGE_NO_ACCESS;
     case PageAllocator::kRead:
       return GUM_PAGE_READ;
     case PageAllocator::kReadWrite:
       return GUM_PAGE_RW;
-    case PageAllocator::kReadExecute:
-      return GUM_PAGE_RX;
     case PageAllocator::kReadWriteExecute:
       return GUM_PAGE_RWX;
+    case PageAllocator::kReadExecute:
+      return GUM_PAGE_RX;
     default:
       g_assert_not_reached ();
       return GUM_PAGE_NO_ACCESS;

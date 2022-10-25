@@ -1,8 +1,10 @@
 helpers := \
+	build/threadedbindprocessor.dylib \
 	build/fixupchainprocessor.dylib \
 	$(NULL)
 
 sources := \
+	threadedbindprocessor.c \
 	fixupchainprocessor.c \
 	$(NULL)
 
@@ -25,7 +27,6 @@ build/%.dylib: %.c $(sources)
 		$< \
 		-o $@ \
 		-dynamiclib \
-		-nostdlib \
 		$(ldflags)
 
 .PHONY: build

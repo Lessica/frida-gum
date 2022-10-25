@@ -3,7 +3,6 @@ gumjs_headers = [
   'gumscript.h',
   'gumscriptbackend.h',
   'gumscriptscheduler.h',
-  'guminspectorserver.h',
 ]
 
 gumjs_sources = [
@@ -11,7 +10,6 @@ gumjs_sources = [
   'gumscript.c',
   'gumscriptbackend.c',
   'gumscriptscheduler.c',
-  'guminspectorserver.c',
   'gumscripttask.c',
   'gumsourcemap.c',
   'gumffi.c',
@@ -178,14 +176,22 @@ gumjs_runtime_sources = [
   'runtime/cmodule/json-glib/json-glib.h',
 ]
 gumjs_runtime_outputs = [
-  'gumquickscript-runtime.h',
-  'gumquickscript-objc.h',
-  'gumquickscript-java.h',
-  'gumv8script-runtime.h',
-  'gumv8script-objc.h',
-  'gumv8script-java.h',
   'gumcmodule-runtime.h',
 ]
+if quickjs_dep.found()
+  gumjs_runtime_outputs += [
+    'gumquickscript-runtime.h',
+    'gumquickscript-objc.h',
+    'gumquickscript-java.h',
+  ]
+endif
+if v8_dep.found()
+  gumjs_runtime_outputs += [
+    'gumv8script-runtime.h',
+    'gumv8script-objc.h',
+    'gumv8script-java.h',
+  ]
+endif
 
 install_headers(gumjs_headers, subdir: install_header_basedir + '/gumjs')
 
@@ -210,11 +216,20 @@ else
   libtcc_incdir = ''
 endif
 
+backends = []
+if quickjs_dep.found()
+  backends += 'qjs'
+endif
+if v8_dep.found()
+  backends += 'v8'
+endif
+
 gumjs_runtime = custom_target('gumjs-runtime',
   input: gumjs_runtime_sources,
   output: gumjs_runtime_outputs,
   command: [
     find_program('generate-runtime.py'),
+    ','.join(backends),
     host_arch,
     host_machine.endian(),
     meson.current_source_dir(),
@@ -227,7 +242,7 @@ gumjs_runtime = custom_target('gumjs-runtime',
 )
 gumjs_sources += [gumjs_runtime]
 
-deps = [
+gumjs_deps = [
   gum_dep,
 
   quickjs_dep,
@@ -239,24 +254,23 @@ deps = [
   ffi_dep,
   libtcc_dep,
   sqlite_dep,
-  libsoup_dep,
 ]
 
 gumjs = library('frida-gumjs-' + api_version, gumjs_sources,
   c_args: frida_component_cflags,
   override_options: [
-    'cpp_std=c++14',
+    'cpp_std=c++17',
     'cpp_eh=none',
     'cpp_rtti=false',
   ],
   include_directories: [bindings_inc],
-  dependencies: deps,
+  dependencies: gumjs_deps,
   install: true,
 )
 
 gumjs_dep = declare_dependency(link_with: gumjs,
   include_directories: [bindings_inc, include_directories('.')],
-  dependencies: deps,
+  dependencies: gumjs_deps,
 )
 
 pkg = import('pkgconfig')
@@ -273,3 +287,42 @@ pkg.generate(filebase: 'frida-gumjs-' + api_version,
     'gumjs_v8=' + v8_dep.found().to_string('enabled', 'disabled'),
   ],
 )
+
+meson.override_dependency('frida-gumjs-' + api_version, gumjs_dep)
+
+gumjs_inspector_headers = [
+  'guminspectorserver.h',
+]
+
+gumjs_inspector_sources = [
+  'guminspectorserver.c',
+]
+
+install_headers(gumjs_inspector_headers, subdir: install_header_basedir + '/gumjs')
+
+gumjs_inspector_deps = [
+  gum_dep,
+  json_glib_dep,
+  libsoup_dep,
+]
+
+gumjs_inspector = library('frida-gumjs-inspector-' + api_version, gumjs_inspector_sources,
+  c_args: frida_component_cflags,
+  dependencies: gumjs_inspector_deps,
+  install: true,
+)
+
+gumjs_inspector_dep = declare_dependency(link_with: gumjs_inspector,
+  include_directories: [bindings_inc],
+  dependencies: gumjs_inspector_deps,
+)
+
+pkg.generate(filebase: 'frida-gumjs-inspector-' + api_version,
+  name: 'GumJS Inspector',
+  version: gum_version,
+  description: 'GumJS Inspector components',
+  subdirs: install_header_basedir,
+  libraries: [gumjs_inspector],
+)
+
+meson.override_dependency('frida-gumjs-inspector-' + api_version, gumjs_inspector_dep)

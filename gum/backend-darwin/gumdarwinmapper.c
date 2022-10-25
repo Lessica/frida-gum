@@ -20,9 +20,6 @@
 # include <gum/arch-arm/gumthumbwriter.h>
 # include <gum/arch-arm64/gumarm64writer.h>
 #endif
-#ifdef HAVE_PTRAUTH
-# include <ptrauth.h>
-#endif
 
 #define GUM_MAPPER_HEADER_BASE_SIZE         64
 #define GUM_MAPPER_CODE_BASE_SIZE           80
@@ -72,7 +69,8 @@ struct _GumDarwinMapper
   gsize destructor_offset;
   guint chained_fixups_count;
 
-  GArray * threaded_binds;
+  GArray * threaded_symbols;
+  GArray * threaded_regions;
 
   GSList * children;
   GHashTable * mappings;
@@ -138,6 +136,12 @@ static gboolean gum_accumulate_chained_fixups_size (
     const GumDarwinChainedFixupsDetails * details, gpointer user_data);
 static gboolean gum_accumulate_bind_footprint_size (
     const GumDarwinBindDetails * details, gpointer user_data);
+static void gum_accumulate_bind_pointer_footprint_size (
+    GumAccumulateFootprintContext * ctx, const GumDarwinBindDetails * details);
+static void gum_accumulate_bind_threaded_table_footprint_size (
+    GumAccumulateFootprintContext * ctx, const GumDarwinBindDetails * details);
+static void gum_accumulate_bind_threaded_items_footprint_size (
+    GumAccumulateFootprintContext * ctx, const GumDarwinBindDetails * details);
 static gboolean gum_accumulate_init_pointers_footprint_size (
     const GumDarwinInitPointersDetails * details, gpointer user_data);
 static gboolean gum_accumulate_init_offsets_footprint_size (
@@ -175,48 +179,78 @@ static void gum_darwin_mapping_free (GumDarwinMapping * self);
 
 G_DEFINE_TYPE (GumDarwinMapper, gum_darwin_mapper, G_TYPE_OBJECT)
 
+/* Compiled from helpers/threadedbindprocessor.c */
+const guint32 gum_threaded_bind_processor_code[] = {
+  0xd2800008U, 0x2a0403e9U, 0xeb09011fU, 0x54000620U, 0xf86878aaU, 0xf940014bU,
+  0xb7f001ebU, 0xd36bfd6cU, 0x9240a96dU, 0x936aa96eU, 0x925531ceU, 0xb3481d8dU,
+  0xaa0e01acU, 0x92407d6dU, 0xf241017fU, 0x9a8003eeU, 0x9a8d018cU, 0x8b0101cdU,
+  0x8b0c01acU, 0xb6f8036bU, 0x14000004U, 0x92403d6cU, 0xf86c786cU, 0xb6f802ebU,
+  0xd371fd6eU, 0xd360bd6dU, 0xaa0a03efU, 0xb3503dafU, 0xf250017fU, 0x9a8f01adU,
+  0x924005d0U, 0xf1000e1fU, 0x9a9f9210U, 0x10000291U, 0xd503201fU, 0xb8b07a30U,
+  0x10000011U, 0x8b100230U, 0xd61f0200U, 0xdac101acU, 0x14000006U, 0xdac109acU,
+  0x14000004U, 0xdac105acU, 0x14000002U, 0xdac10dacU, 0xd373f56bU, 0xf900014cU,
+  0x8b2b4d4aU, 0x35fffa8bU, 0x91000508U, 0x17ffffcfU, 0xd65f03c0U, 0x0000000cU,
+  0x0000001cU, 0x00000014U, 0x00000024U
+};
+
 /* Compiled from helpers/fixupchainprocessor.c */
 const guint32 gum_fixup_chain_processor_code[] = {
-  0xd10283ffU, 0xa9046ffcU, 0xa90567faU, 0xa9065ff8U, 0xa90757f6U, 0xa9084ff4U,
-  0xa9097bfdU, 0x910243fdU, 0xaa0303f3U, 0xaa0203f6U, 0xaa0103f5U, 0xaa0003f7U,
-  0xf9400068U, 0xd63f0100U, 0xf9001fffU, 0xf90017f3U, 0xf9400668U, 0x52800033U,
-  0x9100e3e1U, 0xb9000fe0U, 0x52a00022U, 0x52800023U, 0xd63f0100U, 0x52800019U,
-  0xd2800014U, 0xf9401ff8U, 0x910082baU, 0x529ffd1bU, 0x72affffbU, 0x5281103cU,
-  0xb94012a8U, 0x6b08033fU, 0x540002a0U, 0xb9400348U, 0x0b1b0109U, 0x71002d3fU,
-  0x1ac92269U, 0x0a1c0129U, 0x7a409924U, 0x7a4c0904U, 0x54000121U, 0xb9400b48U,
-  0x8b080340U, 0xf94017e8U, 0xf9400d08U, 0x52800121U, 0xd63f0100U, 0xf8347b00U,
-  0x91000694U, 0xb9400748U, 0x8b08035aU, 0x11000739U, 0x17ffffeaU, 0x8b140f1aU,
-  0x2941eee8U, 0x8b0802f9U, 0xb94016e8U, 0x71000d1fU, 0x54000c80U, 0x7100091fU,
-  0x54000e00U, 0x7100051fU, 0x54000181U, 0xb9400ae8U, 0x8b0802f3U, 0xaa1a03f4U,
-  0xb400011bU, 0xb8404668U, 0x12001d01U, 0x53097d03U, 0x940000a4U, 0xf8008680U,
-  0xd100077bU, 0xb5ffff5bU, 0xd2800009U, 0xb94006e8U, 0x8b0802e8U, 0xcb1602b9U,
-  0xf9000be8U, 0xb840450aU, 0xa901abe8U, 0x529ffff4U, 0xf94013e8U, 0xeb08013fU,
-  0x54000780U, 0xf9001be9U, 0xf9400fe8U, 0xb8697908U, 0x340006a8U, 0xd2800017U,
-  0xf9400be9U, 0x8b080133U, 0x79402a7cU, 0x91005a7bU, 0xeb1c02ffU, 0x540005c0U,
-  0x78777b68U, 0xeb14011fU, 0x54000520U, 0xf9400669U, 0x8b0902a9U, 0x79400a6aU,
-  0x9b0a26e9U, 0x8b080136U, 0xf94002d8U, 0xd37eff10U, 0xd360bf02U, 0xd370c303U,
-  0xd371cb01U, 0xf1000e1fU, 0x9a9f9210U, 0x100009b1U, 0xd503201fU, 0xb8b07a30U,
-  0x8b100230U, 0xd61f0200U, 0xd36bff08U, 0x9240ab09U, 0x936aab0aU, 0x9255314aU,
-  0xb3481d09U, 0xaa0a0128U, 0x8b080320U, 0x1400000cU, 0x8b3842a0U, 0x14000003U,
-  0x92403f08U, 0xf8687b40U, 0xaa1603e4U, 0x94000050U, 0x14000005U, 0x92403f08U,
-  0xf8687b48U, 0xd360cb09U, 0x8b090100U, 0xf90002c0U, 0xd373f708U, 0x8b080ed6U,
-  0xb5fffbc8U, 0x910006f7U, 0x17ffffd2U, 0xf9401be9U, 0x91000529U, 0x17ffffc3U,
-  0xf94017e8U, 0xf9400908U, 0xf9401fe1U, 0xb9400fe0U, 0x52a00022U, 0xd63f0100U,
-  0xa9497bfdU, 0xa9484ff4U, 0xa94757f6U, 0xa9465ff8U, 0xa94567faU, 0xa9446ffcU,
-  0x910283ffU, 0xd65f03c0U, 0xb9400ae8U, 0x8b170108U, 0x91002113U, 0xaa1a03f4U,
-  0xb4fff51bU, 0xb85fc263U, 0x785f8261U, 0x94000045U, 0xf8410668U, 0x8b080008U,
-  0xf8008688U, 0xd100077bU, 0xb5ffff3bU, 0x17ffff9fU, 0xb9400ae8U, 0x8b170108U,
-  0x91001113U, 0xaa1a03f4U, 0xb4fff35bU, 0xb85fc268U, 0x12001d01U, 0x53097d03U,
-  0x94000036U, 0xb9800268U, 0x8b080008U, 0xf8008688U, 0x91002273U, 0xd100077bU,
-  0xb5fffefbU, 0x17ffff8fU, 0xfffffee0U, 0xffffff1cU, 0xffffff00U, 0xffffff08U,
-  0x71000428U, 0x540001cbU, 0xa9bf7bfdU, 0x910003fdU, 0x8b234049U, 0xaa0903eaU,
-  0x3840154bU, 0x71017d7fU, 0x9a890141U, 0xf9401089U, 0xf868d800U, 0xd63f0120U,
-  0xdac143e0U, 0xa8c17bfdU, 0xd65f03c0U, 0xd2800000U, 0xd65f03c0U, 0xb3503c44U,
-  0x7100007fU, 0x9a840048U, 0x71000c3fU, 0x54000208U, 0xaa0103f0U, 0xf1000e1fU,
-  0x9a9f9210U, 0x100001b1U, 0xd503201fU, 0xb8b07a30U, 0x8b100230U, 0xd61f0200U,
-  0xdac10100U, 0xd65f03c0U, 0xdac10500U, 0xd65f03c0U, 0xdac10900U, 0xd65f03c0U,
-  0xdac10d00U, 0xd65f03c0U, 0xffffffe0U, 0xffffffe8U, 0xfffffff0U, 0xfffffff8U,
-  0xaa1803e0U, 0xaa1903e2U, 0xf94017e4U, 0x17ffffd3U
+  0xd10303ffU, 0xa9066ffcU, 0xa90767faU, 0xa9085ff8U, 0xa90957f6U, 0xa90a4ff4U,
+  0xa90b7bfdU, 0x9102c3fdU, 0xaa0303f3U, 0xf9000fe2U, 0xaa0103f6U, 0xaa0003f7U,
+  0xf9400068U, 0xd63f0100U, 0xf9002fffU, 0xf9001bf3U, 0xf9400668U, 0x52800033U,
+  0x910163e1U, 0xb9000fe0U, 0x52a00022U, 0x52800023U, 0xd63f0100U, 0x52800015U,
+  0xd2800014U, 0xf9402ff8U, 0x910082d9U, 0x529ffd1aU, 0x72affffaU, 0x5281103bU,
+  0xb94012c8U, 0x6b0802bfU, 0x540002a0U, 0xb9400328U, 0x0b1a0109U, 0x71002d3fU,
+  0x1ac92269U, 0x0a1b0129U, 0x7a409924U, 0x7a4c0904U, 0x54000121U, 0xb9400b28U,
+  0x8b080320U, 0xf9401be8U, 0xf9400d08U, 0x52800121U, 0xd63f0100U, 0xf8347b00U,
+  0x91000694U, 0xb9400728U, 0x8b080339U, 0x110006b5U, 0x17ffffeaU, 0x8b140f1aU,
+  0x2941cee8U, 0x8b0802f9U, 0xb94016e8U, 0x71000d1fU, 0x54001160U, 0x7100091fU,
+  0x540012e0U, 0x7100051fU, 0x54000181U, 0xb9400ae8U, 0x8b0802f4U, 0xaa1a03f5U,
+  0xb4000113U, 0xb8404688U, 0x12001d01U, 0x53097d03U, 0x940000f1U, 0xf80086a0U,
+  0xd1000673U, 0xb5ffff53U, 0xd2800009U, 0xb94006e8U, 0x8b0802e8U, 0xf9000be8U,
+  0xb840450aU, 0xa9022be8U, 0xb26db3f4U, 0xf94017e8U, 0xeb08013fU, 0x54000c80U,
+  0xf9001fe9U, 0xf94013e8U, 0xb8697908U, 0x34000ba8U, 0xd2800019U, 0xf9400be9U,
+  0x8b080133U, 0x79400e68U, 0x79402a6aU, 0x91005a69U, 0xa904abe9U, 0x121d7909U,
+  0xb90047e9U, 0x7100311fU, 0x529fffe9U, 0x12bfe00aU, 0x9a890155U, 0x7100051fU,
+  0xf9400feaU, 0x9a9f0149U, 0xcb0902d8U, 0x7100191fU, 0x9a8a03e8U, 0xcb0802dbU,
+  0xf9402be8U, 0xeb08033fU, 0x540008c0U, 0xf94027e8U, 0x78797908U, 0x529fffe9U,
+  0xeb09011fU, 0x540007e0U, 0xf9400669U, 0x8b0902c9U, 0x79400a6aU, 0x9b0a2729U,
+  0x8b080137U, 0xb94047e8U, 0x7100091fU, 0x54000241U, 0xf94002e8U, 0xb7f800e8U,
+  0xd36cad09U, 0x92481d29U, 0x92408d0aU, 0x8b0a036aU, 0x8b090149U, 0x14000005U,
+  0x92405d09U, 0xf8697b49U, 0xd358fd0aU, 0x8b2a0129U, 0xf90002e9U, 0xd373f908U,
+  0x8b080af7U, 0xb5fffe28U, 0x14000026U, 0xf94002fcU, 0xd37eff90U, 0xd360bf82U,
+  0xd370c383U, 0xd371cb81U, 0xf1000e1fU, 0x9a9f9210U, 0x100009f1U, 0xd503201fU,
+  0xb8b07a30U, 0x10000011U, 0x8b100230U, 0xd61f0200U, 0xd373cb88U, 0x92481d08U,
+  0x9240ab89U, 0x8b090309U, 0x8b080120U, 0x1400000fU, 0x8b3c42c0U, 0x14000003U,
+  0x8a150388U, 0xf8687b40U, 0xaa1703e4U, 0x94000076U, 0x14000008U, 0x8a150388U,
+  0xf8687b48U, 0xd360cb89U, 0xf141013fU, 0x9a9433e9U, 0xb360cb89U, 0x8b090100U,
+  0xf90002e0U, 0xd373f788U, 0x8b080ef7U, 0xb5fffb88U, 0x91000739U, 0x17ffffb9U,
+  0xf9401fe9U, 0x91000529U, 0x17ffff9bU, 0xf9401be8U, 0xf9400908U, 0xf9402fe1U,
+  0xb9400fe0U, 0x52a00022U, 0xd63f0100U, 0xa94b7bfdU, 0xa94a4ff4U, 0xa94957f6U,
+  0xa9485ff8U, 0xa94767faU, 0xa9466ffcU, 0x910303ffU, 0xd65f03c0U, 0xb9400ae8U,
+  0x8b170108U, 0x91002114U, 0xaa1a03f5U, 0xb4fff033U, 0xb85fc283U, 0x785f8281U,
+  0x9400006bU, 0xf8410688U, 0x8b080008U, 0xf80086a8U, 0xd1000673U, 0xb5ffff33U,
+  0x17ffff78U, 0xb9400ae8U, 0x8b170108U, 0x91001114U, 0xaa1a03f5U, 0xb4ffee73U,
+  0xb85fc288U, 0x12001d01U, 0x53097d03U, 0x9400005cU, 0xb9800288U, 0x8b080008U,
+  0xf80086a8U, 0x91002294U, 0xd1000673U, 0xb5fffef3U, 0x17ffff68U, 0x0000000cU,
+  0x00000040U, 0x00000024U, 0x0000002cU, 0xa9bd57f6U, 0xa9014ff4U, 0xa9027bfdU,
+  0x910083fdU, 0x71000436U, 0x5400054bU, 0xaa0403f3U, 0xaa0003f4U, 0x8b234048U,
+  0xaa0803e9U, 0x3840152aU, 0x71017d5fU, 0x9a891115U, 0xf9401488U, 0x10000901U,
+  0xd503201fU, 0x94000044U, 0x34000340U, 0xf9401668U, 0x100008a1U, 0xd503201fU,
+  0x9400003fU, 0x340002a0U, 0xf9401668U, 0x50000841U, 0xd503201fU, 0x9400003aU,
+  0x34000200U, 0xf9401668U, 0x10000821U, 0xd503201fU, 0x94000035U, 0x34000160U,
+  0xf9401668U, 0x30000821U, 0xd503201fU, 0x94000030U, 0x340000c0U, 0xf9401268U,
+  0xf8765a80U, 0xaa1503e1U, 0xd63f0100U, 0x14000003U, 0x10000460U, 0xd503201fU,
+  0xdac143e0U, 0x14000002U, 0xd2800000U, 0xa9427bfdU, 0xa9414ff4U, 0xa8c357f6U,
+  0xd65f03c0U, 0xb3503c44U, 0x7100007fU, 0x9a840048U, 0x71000c3fU, 0x54000228U,
+  0x2a0103f0U, 0xf1000e1fU, 0x9a9f9210U, 0x100001d1U, 0xd503201fU, 0xb8b07a30U,
+  0x10000011U, 0x8b100230U, 0xd61f0200U, 0xdac10100U, 0xd65f03c0U, 0xdac10500U,
+  0xd65f03c0U, 0xdac10900U, 0xd65f03c0U, 0xdac10d00U, 0xd65f03c0U, 0x0000000cU,
+  0x00000014U, 0x0000001cU, 0x00000024U, 0x52800000U, 0xd65f03c0U, 0xaa1803e0U,
+  0xaa1903e2U, 0xf9401be4U, 0x17ffffadU, 0xaa1503e0U, 0xd61f0100U, 0x6574615fU,
+  0x00746978U, 0x6574615fU, 0x5f746978U, 0x5f5f0062U, 0x6178635fU, 0x6574615fU,
+  0x00746978U, 0x635f5f5fU, 0x745f6178U, 0x61657268U, 0x74615f64U, 0x74697865U,
+  0x745f5f00U, 0x615f766cU, 0x69786574U, 0x00000074U
 };
 
 static void
@@ -279,7 +313,8 @@ gum_darwin_mapper_finalize (GObject * object)
   g_clear_pointer (&self->mappings, g_hash_table_unref);
   g_slist_free_full (self->children, g_object_unref);
 
-  g_clear_pointer (&self->threaded_binds, g_array_unref);
+  g_clear_pointer (&self->threaded_regions, g_array_unref);
+  g_clear_pointer (&self->threaded_symbols, g_array_unref);
 
   g_free (self->runtime);
 
@@ -631,8 +666,6 @@ gum_darwin_mapper_map (GumDarwinMapper * self,
 
   g_object_set (module, "base-address", macho_base_address, NULL);
 
-  gum_darwin_mapper_alloc_and_emit_runtime (self, base_address, total_vm_size);
-
   gum_darwin_module_enumerate_rebases (module, gum_darwin_mapper_rebase, &ctx);
   if (!ctx.success)
     goto beach;
@@ -644,6 +677,8 @@ gum_darwin_mapper_map (GumDarwinMapper * self,
   gum_darwin_module_enumerate_lazy_binds (module, gum_darwin_mapper_bind, &ctx);
   if (!ctx.success)
     goto beach;
+
+  gum_darwin_mapper_alloc_and_emit_runtime (self, base_address, total_vm_size);
 
   for (i = 0; i != module->segments->len; i++)
   {
@@ -1332,6 +1367,7 @@ gum_emit_arm64_runtime (GumDarwinMapper * self,
   GumDarwinModule * module = self->module;
   GumArm64Writer aw;
   GumEmitArm64Context ctx;
+  GumAddress process_threaded_items, threaded_symbols, threaded_regions;
   GSList * children_reversed;
 
   gum_arm64_writer_init (&aw, output_buffer);
@@ -1347,6 +1383,24 @@ gum_emit_arm64_runtime (GumDarwinMapper * self,
     /* atexit stub */
     gum_arm64_writer_put_ldr_reg_u64 (&aw, ARM64_REG_X0, 0);
     gum_arm64_writer_put_ret (&aw);
+  }
+
+  if (self->threaded_regions != NULL)
+  {
+    process_threaded_items = aw.pc;
+    gum_arm64_writer_put_bytes (&aw,
+        (const guint8 *) gum_threaded_bind_processor_code,
+        sizeof (gum_threaded_bind_processor_code));
+
+    threaded_symbols = aw.pc;
+    gum_arm64_writer_put_bytes (&aw,
+        (const guint8 *) self->threaded_symbols->data,
+        self->threaded_symbols->len * sizeof (GumAddress));
+
+    threaded_regions = aw.pc;
+    gum_arm64_writer_put_bytes (&aw,
+        (const guint8 *) self->threaded_regions->data,
+        self->threaded_regions->len * sizeof (GumAddress));
   }
 
   if (self->chained_fixups_count > 0)
@@ -1366,6 +1420,7 @@ gum_emit_arm64_runtime (GumDarwinMapper * self,
     api.mach_vm_deallocate = gum_resolve_api (libsystem, "mach_vm_deallocate");
     api.dlopen = gum_resolve_api (libsystem, "dlopen");
     api.dlsym = gum_resolve_api (libsystem, "dlsym");
+    api.strcmp = gum_resolve_api (libsystem, "strcmp");
     dlclose (libsystem);
     gum_arm64_writer_put_bytes (&aw, (const guint8 *) &api, sizeof (api));
   }
@@ -1378,6 +1433,18 @@ gum_emit_arm64_runtime (GumDarwinMapper * self,
 
   g_slist_foreach (self->children,
       (GFunc) gum_emit_arm64_child_constructor_call, &ctx);
+  if (self->threaded_regions != NULL)
+  {
+    gum_arm64_writer_put_call_address_with_arguments (&aw,
+        process_threaded_items,
+        6,
+        GUM_ARG_ADDRESS, module->preferred_address,
+        GUM_ARG_ADDRESS, gum_darwin_module_get_slide (module),
+        GUM_ARG_ADDRESS, (GumAddress) self->threaded_symbols->len,
+        GUM_ARG_ADDRESS, threaded_symbols,
+        GUM_ARG_ADDRESS, (GumAddress) self->threaded_regions->len,
+        GUM_ARG_ADDRESS, threaded_regions);
+  }
   gum_darwin_module_enumerate_chained_fixups (module,
       (GumFoundDarwinChainedFixupsFunc) gum_emit_arm64_chained_fixup_call,
       &ctx);
@@ -1622,17 +1689,38 @@ gum_accumulate_bind_footprint_size (const GumDarwinBindDetails * details,
                                     gpointer user_data)
 {
   GumAccumulateFootprintContext * ctx = user_data;
+
+  switch (details->type)
+  {
+    case GUM_DARWIN_BIND_POINTER:
+      gum_accumulate_bind_pointer_footprint_size (ctx, details);
+      break;
+    case GUM_DARWIN_BIND_THREADED_TABLE:
+      gum_accumulate_bind_threaded_table_footprint_size (ctx, details);
+      break;
+    case GUM_DARWIN_BIND_THREADED_ITEMS:
+      gum_accumulate_bind_threaded_items_footprint_size (ctx, details);
+      break;
+    default:
+      break;
+  }
+
+  return TRUE;
+}
+
+static void
+gum_accumulate_bind_pointer_footprint_size (
+    GumAccumulateFootprintContext * ctx,
+    const GumDarwinBindDetails * details)
+{
   GumDarwinMapper * self = ctx->mapper;
   GumDarwinMapping * dependency;
   GumDarwinSymbolValue value;
 
-  if (details->type != GUM_DARWIN_BIND_POINTER)
-    return TRUE;
-
   dependency = gum_darwin_mapper_get_dependency_by_ordinal (self,
       details->library_ordinal, NULL);
   if (dependency == NULL)
-    return TRUE;
+    return;
 
   if (gum_darwin_mapper_resolve_symbol (self, dependency->module,
       details->symbol_name, &value))
@@ -1640,8 +1728,23 @@ gum_accumulate_bind_footprint_size (const GumDarwinBindDetails * details,
     if (value.resolver != 0)
       ctx->total += GUM_MAPPER_RESOLVER_SIZE;
   }
+}
 
-  return TRUE;
+static void
+gum_accumulate_bind_threaded_table_footprint_size (
+    GumAccumulateFootprintContext * ctx,
+    const GumDarwinBindDetails * details)
+{
+  ctx->total += sizeof (gum_threaded_bind_processor_code);
+  ctx->total += details->threaded_table_size * sizeof (GumAddress);
+}
+
+static void
+gum_accumulate_bind_threaded_items_footprint_size (
+    GumAccumulateFootprintContext * ctx,
+    const GumDarwinBindDetails * details)
+{
+  ctx->total += sizeof (GumAddress);
 }
 
 static gboolean
@@ -2073,9 +2176,9 @@ gum_darwin_mapper_bind_pointer (GumDarwinMapper * self,
   if (success)
     value.address += bind->addend;
 
-  if (self->threaded_binds != NULL)
+  if (self->threaded_symbols != NULL)
   {
-    g_array_append_val (self->threaded_binds, value.address);
+    g_array_append_val (self->threaded_symbols, value.address);
   }
   else
   {
@@ -2129,9 +2232,12 @@ gum_darwin_mapper_bind_table (GumDarwinMapper * self,
                               const GumDarwinBindDetails * bind,
                               GError ** error)
 {
-  g_clear_pointer (&self->threaded_binds, g_array_unref);
-  self->threaded_binds = g_array_sized_new (FALSE, FALSE, sizeof (GumAddress),
+  g_clear_pointer (&self->threaded_symbols, g_array_unref);
+  g_clear_pointer (&self->threaded_regions, g_array_unref);
+  self->threaded_symbols = g_array_sized_new (FALSE, FALSE, sizeof (GumAddress),
       bind->threaded_table_size);
+  self->threaded_regions = g_array_sized_new (FALSE, FALSE, sizeof (GumAddress),
+      256);
 
   return TRUE;
 }
@@ -2141,99 +2247,16 @@ gum_darwin_mapper_bind_items (GumDarwinMapper * self,
                               const GumDarwinBindDetails * bind,
                               GError ** error)
 {
-  GArray * threaded_binds = self->threaded_binds;
-  const GumDarwinSegment * segment = bind->segment;
-  GumAddress preferred_base_address, slide;
-  guint64 cursor;
-  GumDarwinThreadedItem item;
+  GArray * threaded_regions = self->threaded_regions;
+  GumAddress region_start;
 
-  if (threaded_binds == NULL)
+  if (threaded_regions == NULL)
     goto invalid_data;
 
-  preferred_base_address = self->module->preferred_address;
-  slide = gum_darwin_module_get_slide (self->module);
+  region_start =
+      self->module->base_address + bind->segment->vm_address + bind->offset;
 
-  cursor = bind->offset;
-
-  do
-  {
-    guint64 * slot, bound_value;
-
-    slot = gum_darwin_mapper_data_from_offset (self,
-        segment->file_offset + cursor, sizeof (guint64));
-    if (slot == NULL)
-      goto invalid_data;
-    gum_darwin_threaded_item_parse (*slot, &item);
-
-    if (item.type == GUM_DARWIN_THREADED_BIND)
-    {
-      guint ordinal = item.bind_ordinal;
-
-      if (ordinal >= threaded_binds->len)
-        goto invalid_data;
-
-      bound_value = g_array_index (threaded_binds, GumAddress, ordinal);
-    }
-    else if (item.type == GUM_DARWIN_THREADED_REBASE)
-    {
-      bound_value = item.rebase_address;
-
-      if (item.is_authenticated)
-        bound_value += preferred_base_address;
-
-      bound_value += slide;
-    }
-    else
-    {
-      g_assert_not_reached ();
-    }
-
-    if (item.is_authenticated)
-    {
-#ifdef HAVE_PTRAUTH
-      gpointer p = GSIZE_TO_POINTER (bound_value);
-      uintptr_t d = item.diversity;
-
-      if (item.has_address_diversity)
-      {
-        gpointer slot_location;
-
-        slot_location = GSIZE_TO_POINTER (segment->vm_address + slide + cursor);
-
-        d = ptrauth_blend_discriminator (slot_location, d);
-      }
-
-      switch (item.key)
-      {
-        case ptrauth_key_asia:
-          p = ptrauth_sign_unauthenticated (p, ptrauth_key_asia, d);
-          break;
-        case ptrauth_key_asib:
-          p = ptrauth_sign_unauthenticated (p, ptrauth_key_asib, d);
-          break;
-        case ptrauth_key_asda:
-          p = ptrauth_sign_unauthenticated (p, ptrauth_key_asda, d);
-          break;
-        case ptrauth_key_asdb:
-          p = ptrauth_sign_unauthenticated (p, ptrauth_key_asdb, d);
-          break;
-        default:
-          g_assert_not_reached ();
-      }
-
-      *slot = GPOINTER_TO_SIZE (p);
-#else
-      goto invalid_data;
-#endif
-    }
-    else
-    {
-      *slot = bound_value;
-    }
-
-    cursor += item.delta * sizeof (guint64);
-  }
-  while (item.delta != 0);
+  g_array_append_val (threaded_regions, region_start);
 
   return TRUE;
 

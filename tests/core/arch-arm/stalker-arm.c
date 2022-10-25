@@ -65,6 +65,7 @@ TESTLIST_BEGIN (stalker)
   TESTENTRY (arm_ldr_pc_post_index_imm)
   TESTENTRY (arm_ldr_pc_pre_index_imm_negative)
   TESTENTRY (arm_ldr_pc_post_index_imm_negative)
+  TESTENTRY (arm_ldr_pc_shift)
   TESTENTRY (arm_sub_pc)
   TESTENTRY (arm_add_pc)
 
@@ -1693,6 +1694,36 @@ TESTCASE (arm_ldr_pc_post_index_imm_negative)
   GUM_ASSERT_EVENT_ADDR (block, INVOKEE_BLOCK_INDEX, end, func + 16);
 }
 
+TESTCODE (arm_ldr_pc_shift_code,
+  0x00, 0x00, 0x40, 0xe0, /* sub r0, r0, r0           */
+  0x04, 0x00, 0x80, 0xe2, /* add r0, r0, 4            */
+  0x00, 0xf1, 0x9f, 0xe7, /* ldr pc, [pc, r0, lsl #2] */
+  0xf0, 0x01, 0xf0, 0xe7, /* udf 0x10                 */
+
+  0x22, 0x22, 0x22, 0x22,
+  0x44, 0x44, 0x44, 0x44,
+  0x66, 0x66, 0x66, 0x66,
+  0x88, 0x88, 0x88, 0x88,
+  0xaa, 0xaa, 0xaa, 0xaa, /* Branch Target            */
+
+  0x0e, 0xf0, 0xa0, 0xe1  /* mov pc, lr               */
+);
+
+TESTCASE (arm_ldr_pc_shift)
+{
+  GumAddress func;
+  guint32 * code;
+
+  func = DUP_TESTCODE (arm_ldr_pc_shift_code);
+  code = GSIZE_TO_POINTER (func);
+  g_assert_cmpuint (code[8], ==, 0xaaaaaaaa);
+  patch_code_pointer (func, 8 * sizeof (gsize), func + (9 * sizeof (gsize)));
+
+  g_assert_cmpuint (FOLLOW_AND_INVOKE (func), ==, 4);
+
+  g_assert_cmpuint (fixture->sink->events->len, ==, 0);
+}
+
 TESTCODE (arm_sub_pc,
   0x00, 0x00, 0x40, 0xe0, /* sub r0, r0, r0 */
   0x01, 0x00, 0x00, 0xea, /* b part_two     */
@@ -2102,10 +2133,17 @@ TESTCODE (thumb_tbh,
   0x5f, 0xf0, 0x02, 0x0c, /* movs.w ip, 2         */
   0xdf, 0xe8, 0x1c, 0xf0, /* tbh [pc, ip, lsl 1]  */
 
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN
   /* table1:                                      */
   0x03, 0x00,             /* (one - table1) / 2   */
   0x04, 0x00,             /* (two - table1) / 2   */
   0x05, 0x00,             /* (three - table1) / 2 */
+#else
+  /* table1:                                      */
+  0x00, 0x03,             /* (one - table1) / 2   */
+  0x00, 0x04,             /* (two - table1) / 2   */
+  0x00, 0x05,             /* (three - table1) / 2 */
+#endif
 
   /* one:                                         */
   0x40, 0x1c,             /* adds r0, r0, 1       */
@@ -2190,13 +2228,13 @@ TESTCASE (self_modifying_code_should_be_detected_with_threshold_minus_one)
   value = f ();
   g_assert_cmpuint (value, ==, 1);
 
-  patch_code_pointer (func, 4, 0xe2800002);
+  patch_code_pointer (func, 4, GSIZE_TO_LE (0xe2800002));
   value = f ();
   g_assert_cmpuint (value, ==, 2);
   f ();
   f ();
 
-  patch_code_pointer (func, 4, 0xe2800003);
+  patch_code_pointer (func, 4, GSIZE_TO_LE (0xe2800003));
   value = f ();
   g_assert_cmpuint (value, ==, 3);
 
@@ -2223,7 +2261,7 @@ TESTCASE (self_modifying_code_should_not_be_detected_with_threshold_zero)
   value = f ();
   g_assert_cmpuint (value, ==, 1);
 
-  patch_code_pointer (func, 4, 0xe2800002);
+  patch_code_pointer (func, 4, GSIZE_TO_LE (0xe2800002));
   value = f ();
   g_assert_cmpuint (value, ==, 1);
 
@@ -2250,13 +2288,13 @@ TESTCASE (self_modifying_code_should_be_detected_with_threshold_one)
   value = f ();
   g_assert_cmpuint (value, ==, 1);
 
-  patch_code_pointer (func, 4, 0xe2800002);
+  patch_code_pointer (func, 4, GSIZE_TO_LE (0xe2800002));
   value = f ();
   g_assert_cmpuint (value, ==, 2);
   f ();
   f ();
 
-  patch_code_pointer (func, 4, 0xe2800003);
+  patch_code_pointer (func, 4, GSIZE_TO_LE (0xe2800003));
   value = f ();
   g_assert_cmpuint (value, ==, 2);
 

@@ -53,7 +53,7 @@ typedef void (* GumStalkerIncrementFunc) (GumStalkerObserver * self);
 typedef void (* GumStalkerNotifyBackpatchFunc) (GumStalkerObserver * self,
     const GumBackpatch * backpatch, gsize size);
 typedef void (* GumStalkerSwitchCallbackFunc) (GumStalkerObserver * self,
-    gpointer from_address, gpointer start_address, const cs_insn * from_insn,
+    gpointer from_address, gpointer start_address, gpointer from_insn,
     gpointer * target);
 typedef union _GumStalkerWriter GumStalkerWriter;
 typedef void (* GumStalkerTransformerCallback) (GumStalkerIterator * iterator,
@@ -269,7 +269,7 @@ GUM_API void gum_stalker_observer_notify_backpatch (
 
 GUM_API void gum_stalker_observer_switch_callback (
     GumStalkerObserver * observer, gpointer from_address,
-    gpointer start_address, const cs_insn * from_insn, gpointer * target);
+    gpointer start_address, gpointer from_insn, gpointer * target);
 
 G_END_DECLS
 

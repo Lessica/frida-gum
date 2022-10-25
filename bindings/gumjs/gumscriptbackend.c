@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015-2021 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2015-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -28,8 +28,8 @@ struct _GumSqliteBlock
 
 static void gum_script_backend_deinit_scheduler (void);
 
-static void gum_script_backend_init_dependencies (void);
-static void gum_script_backend_deinit_dependencies (void);
+static void gum_script_backend_init_internals (void);
+static void gum_script_backend_deinit_internals (void);
 
 #ifdef HAVE_SQLITE
 static int gum_sqlite_allocator_init (void * data);
@@ -42,7 +42,9 @@ static int gum_sqlite_allocator_roundup (int size);
 #endif
 
 G_DEFINE_INTERFACE_WITH_CODE (GumScriptBackend, gum_script_backend,
-    G_TYPE_OBJECT, gum_script_backend_init_dependencies ())
+    G_TYPE_OBJECT, gum_script_backend_init_internals ())
+
+static GRegex * gum_inline_source_map_pattern;
 
 static void
 gum_script_backend_default_init (GumScriptBackendInterface * iface)
@@ -143,12 +145,13 @@ void
 gum_script_backend_create (GumScriptBackend * self,
                            const gchar * name,
                            const gchar * source,
+                           GBytes * snapshot,
                            GCancellable * cancellable,
                            GAsyncReadyCallback callback,
                            gpointer user_data)
 {
-  GUM_SCRIPT_BACKEND_GET_IFACE (self)->create (self, name, source, cancellable,
-      callback, user_data);
+  GUM_SCRIPT_BACKEND_GET_IFACE (self)->create (self, name, source, snapshot,
+      cancellable, callback, user_data);
 }
 
 GumScript *
@@ -164,21 +167,23 @@ GumScript *
 gum_script_backend_create_sync (GumScriptBackend * self,
                                 const gchar * name,
                                 const gchar * source,
+                                GBytes * snapshot,
                                 GCancellable * cancellable,
                                 GError ** error)
 {
   return GUM_SCRIPT_BACKEND_GET_IFACE (self)->create_sync (self, name, source,
-      cancellable, error);
+      snapshot, cancellable, error);
 }
 
 void
 gum_script_backend_create_from_bytes (GumScriptBackend * self,
                                       GBytes * bytes,
+                                      GBytes * snapshot,
                                       GCancellable * cancellable,
                                       GAsyncReadyCallback callback,
                                       gpointer user_data)
 {
-  GUM_SCRIPT_BACKEND_GET_IFACE (self)->create_from_bytes (self, bytes,
+  GUM_SCRIPT_BACKEND_GET_IFACE (self)->create_from_bytes (self, bytes, snapshot,
       cancellable, callback, user_data);
 }
 
@@ -194,11 +199,12 @@ gum_script_backend_create_from_bytes_finish (GumScriptBackend * self,
 GumScript *
 gum_script_backend_create_from_bytes_sync (GumScriptBackend * self,
                                            GBytes * bytes,
+                                           GBytes * snapshot,
                                            GCancellable * cancellable,
                                            GError ** error)
 {
   return GUM_SCRIPT_BACKEND_GET_IFACE (self)->create_from_bytes_sync (self,
-      bytes, cancellable, error);
+      bytes, snapshot, cancellable, error);
 }
 
 void
@@ -234,21 +240,35 @@ gum_script_backend_compile_sync (GumScriptBackend * self,
 }
 
 void
-gum_script_backend_set_debug_message_handler (
-    GumScriptBackend * self,
-    GumScriptBackendDebugMessageHandler handler,
-    gpointer data,
-    GDestroyNotify data_destroy)
+gum_script_backend_snapshot (GumScriptBackend * self,
+                             const gchar * embed_script,
+                             const gchar * warmup_script,
+                             GCancellable * cancellable,
+                             GAsyncReadyCallback callback,
+                             gpointer user_data)
 {
-  GUM_SCRIPT_BACKEND_GET_IFACE (self)->set_debug_message_handler (self, handler,
-      data, data_destroy);
+  GUM_SCRIPT_BACKEND_GET_IFACE (self)->snapshot (self, embed_script,
+      warmup_script, cancellable, callback, user_data);
 }
 
-void
-gum_script_backend_post_debug_message (GumScriptBackend * self,
-                                       const gchar * message)
+GBytes *
+gum_script_backend_snapshot_finish (GumScriptBackend * self,
+                                    GAsyncResult * result,
+                                    GError ** error)
 {
-  GUM_SCRIPT_BACKEND_GET_IFACE (self)->post_debug_message (self, message);
+  return GUM_SCRIPT_BACKEND_GET_IFACE (self)->snapshot_finish (self, result,
+      error);
+}
+
+GBytes *
+gum_script_backend_snapshot_sync (GumScriptBackend * self,
+                                  const gchar * embed_script,
+                                  const gchar * warmup_script,
+                                  GCancellable * cancellable,
+                                  GError ** error)
+{
+  return GUM_SCRIPT_BACKEND_GET_IFACE (self)->snapshot_sync (self, embed_script,
+      warmup_script, cancellable, error);
 }
 
 void
@@ -290,8 +310,37 @@ gum_script_backend_deinit_scheduler (void)
   g_object_unref (gum_script_backend_get_scheduler ());
 }
 
+gchar *
+gum_script_backend_extract_inline_source_map (const gchar * source)
+{
+  gchar * result = NULL;
+  GMatchInfo * match_info;
+
+  g_regex_match (gum_inline_source_map_pattern, source, 0, &match_info);
+  if (g_match_info_matches (match_info))
+  {
+    gchar * data_encoded, * data;
+    gsize size;
+
+    data_encoded = g_match_info_fetch (match_info, 1);
+
+    data = (gchar *) g_base64_decode (data_encoded, &size);
+    if (data != NULL && g_utf8_validate (data, size, NULL))
+    {
+      result = g_strndup (data, size);
+    }
+    g_free (data);
+
+    g_free (data_encoded);
+  }
+
+  g_match_info_free (match_info);
+
+  return result;
+}
+
 static void
-gum_script_backend_init_dependencies (void)
+gum_script_backend_init_internals (void)
 {
 #ifdef HAVE_SQLITE
   sqlite3_mem_methods gum_mem_methods = {
@@ -311,12 +360,18 @@ gum_script_backend_init_dependencies (void)
   sqlite3_initialize ();
 #endif
 
-  _gum_register_early_destructor (gum_script_backend_deinit_dependencies);
+  gum_inline_source_map_pattern = g_regex_new ("//[#@][ \\t]sourceMappingURL="
+      "[ \\t]*data:application/json;.*?base64,([^\\s'\"]*)[ \\t]*$",
+      G_REGEX_MULTILINE, 0, NULL);
+
+  _gum_register_early_destructor (gum_script_backend_deinit_internals);
 }
 
 static void
-gum_script_backend_deinit_dependencies (void)
+gum_script_backend_deinit_internals (void)
 {
+  g_regex_unref (gum_inline_source_map_pattern);
+
 #ifdef HAVE_SQLITE
   sqlite3_shutdown ();
 #endif

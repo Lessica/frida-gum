@@ -395,7 +395,7 @@ void
 gum_stalker_observer_switch_callback (GumStalkerObserver * observer,
                                       gpointer from_address,
                                       gpointer start_address,
-                                      const cs_insn * from_insn,
+                                      gpointer from_insn,
                                       gpointer * target)
 {
   GumStalkerObserverInterface * iface;

@@ -16,6 +16,15 @@
 #include "gumv8macros.h"
 #include "gumv8scope.h"
 #include "gumv8script-priv.h"
+#ifdef HAVE_OBJC_BRIDGE
+# include "gumv8script-objc.h"
+#endif
+#ifdef HAVE_SWIFT_BRIDGE
+# include "gumv8script-swift.h"
+#endif
+#ifdef HAVE_JAVA_BRIDGE
+# include "gumv8script-java.h"
+#endif
 
 #ifdef _MSC_VER
 # include <intrin.h>
@@ -44,8 +53,8 @@ struct GumV8FlushCallback
 struct GumV8WeakRef
 {
   guint id;
-  GumPersistent<Value>::type * target;
-  GumPersistent<Function>::type * callback;
+  Global<Value> * target;
+  Global<Function> * callback;
 
   GumV8Core * core;
 };
@@ -54,7 +63,7 @@ struct GumV8ScheduledCallback
 {
   gint id;
   gboolean repeat;
-  GumPersistent<Function>::type * func;
+  Global<Function> * func;
   GSource * source;
 
   GumV8Core * core;
@@ -62,13 +71,13 @@ struct GumV8ScheduledCallback
 
 struct GumV8ExceptionSink
 {
-  GumPersistent<Function>::type * callback;
+  Global<Function> * callback;
   Isolate * isolate;
 };
 
 struct GumV8MessageSink
 {
-  GumPersistent<Function>::type * callback;
+  Global<Function> * callback;
   Isolate * isolate;
 };
 
@@ -110,7 +119,7 @@ enum _GumV8ReturnValueShape
 
 struct GumV8NativeFunction
 {
-  GumPersistent<Object>::type * wrapper;
+  Global<Object> * wrapper;
 
   GCallback implementation;
   GumV8SchedulingBehavior scheduling;
@@ -130,21 +139,21 @@ struct GumV8NativeFunction
 
 struct GumV8CallbackContext
 {
-  GumPersistent<Object>::type * wrapper;
-  GumPersistent<Object>::type * cpu_context;
+  Global<Object> * wrapper;
+  Global<Object> * cpu_context;
   GumAddress return_address;
   GumAddress raw_return_address;
 };
 
 struct GumV8MatchPattern
 {
-  GumPersistent<Object>::type * wrapper;
+  Global<Object> * wrapper;
   GumMatchPattern * handle;
 };
 
 struct GumV8SourceMap
 {
-  GumPersistent<Object>::type * wrapper;
+  Global<Object> * wrapper;
   GumSourceMap * handle;
 
   GumV8Core * core;
@@ -182,7 +191,12 @@ GUMJS_DECLARE_FUNCTION (gumjs_frida_objc_load)
 GUMJS_DECLARE_FUNCTION (gumjs_frida_swift_load)
 GUMJS_DECLARE_FUNCTION (gumjs_frida_java_load)
 
+GUMJS_DECLARE_FUNCTION (gumjs_script_evaluate)
+GUMJS_DECLARE_FUNCTION (gumjs_script_load)
+GUMJS_DECLARE_FUNCTION (gumjs_script_register_source_map)
 GUMJS_DECLARE_FUNCTION (gumjs_script_find_source_map)
+static gchar * gum_query_script_for_inline_source_map (Isolate * isolate,
+    Local<Script> script);
 GUMJS_DECLARE_FUNCTION (gumjs_script_next_tick)
 GUMJS_DECLARE_FUNCTION (gumjs_script_pin)
 GUMJS_DECLARE_FUNCTION (gumjs_script_unpin)
@@ -380,6 +394,9 @@ static const GumV8Function gumjs_frida_functions[] =
 
 static const GumV8Function gumjs_script_functions[] =
 {
+  { "evaluate", gumjs_script_evaluate },
+  { "_load", gumjs_script_load },
+  { "registerSourceMap", gumjs_script_register_source_map },
   { "_findSourceMap", gumjs_script_find_source_map },
   { "_nextTick", gumjs_script_next_tick },
   { "pin", gumjs_script_pin },
@@ -519,7 +536,10 @@ _gum_v8_core_init (GumV8Core * self,
   NamedPropertyHandlerConfiguration global_access;
   global_access.getter = gumjs_global_get;
   global_access.data = module;
-  global_access.flags = PropertyHandlerFlags::kNonMasking;
+  global_access.flags = (PropertyHandlerFlags) (
+        (int) PropertyHandlerFlags::kNonMasking |
+        (int) PropertyHandlerFlags::kOnlyInterceptStrings
+      );
   scope->SetHandler (global_access);
 
   auto frida = _gum_v8_create_module ("Frida", scope, isolate);
@@ -536,21 +556,20 @@ _gum_v8_core_init (GumV8Core * self,
   auto int64 = _gum_v8_create_class ("Int64", gumjs_int64_construct, scope,
       module, isolate);
   _gum_v8_class_add (int64, gumjs_int64_functions, module, isolate);
-  int64->InstanceTemplate ()->SetInternalFieldCount (8 / GLIB_SIZEOF_VOID_P);
-  self->int64 = new GumPersistent<FunctionTemplate>::type (isolate, int64);
+  int64->InstanceTemplate ()->SetInternalFieldCount (1);
+  self->int64 = new Global<FunctionTemplate> (isolate, int64);
 
   auto uint64 = _gum_v8_create_class ("UInt64", gumjs_uint64_construct, scope,
       module, isolate);
   _gum_v8_class_add (uint64, gumjs_uint64_functions, module, isolate);
-  uint64->InstanceTemplate ()->SetInternalFieldCount (8 / GLIB_SIZEOF_VOID_P);
-  self->uint64 = new GumPersistent<FunctionTemplate>::type (isolate, uint64);
+  uint64->InstanceTemplate ()->SetInternalFieldCount (1);
+  self->uint64 = new Global<FunctionTemplate> (isolate, uint64);
 
   auto native_pointer = _gum_v8_create_class ("NativePointer",
       gumjs_native_pointer_construct, scope, module, isolate);
   _gum_v8_class_add (native_pointer, gumjs_native_pointer_functions, module,
       isolate);
-  self->native_pointer =
-      new GumPersistent<FunctionTemplate>::type (isolate, native_pointer);
+  self->native_pointer = new Global<FunctionTemplate> (isolate, native_pointer);
 
   auto native_function = _gum_v8_create_class ("NativeFunction",
       gumjs_native_function_construct, scope, module, isolate);
@@ -562,7 +581,7 @@ _gum_v8_core_init (GumV8Core * self,
       gumjs_native_function_invoke, module);
   native_function_object->SetInternalFieldCount (2);
   self->native_function =
-      new GumPersistent<FunctionTemplate>::type (isolate, native_function);
+      new Global<FunctionTemplate> (isolate, native_function);
 
   auto system_function = _gum_v8_create_class ("SystemFunction",
       gumjs_system_function_construct, scope, module, isolate);
@@ -577,21 +596,18 @@ _gum_v8_core_init (GumV8Core * self,
   native_callback->Inherit (native_pointer);
   native_callback->InstanceTemplate ()->SetInternalFieldCount (2);
   self->native_callback =
-      new GumPersistent<FunctionTemplate>::type (isolate, native_callback);
+      new Global<FunctionTemplate> (isolate, native_callback);
 
   auto cc = _gum_v8_create_class ("CallbackContext", nullptr, scope,
       module, isolate);
   _gum_v8_class_add (cc, gumjs_callback_context_values, module, isolate);
-  self->callback_context =
-      new GumPersistent<FunctionTemplate>::type (isolate, cc);
+  self->callback_context = new Global<FunctionTemplate> (isolate, cc);
 
   auto cpu_context = _gum_v8_create_class ("CpuContext",
       gumjs_cpu_context_construct, scope, module, isolate);
   auto cpu_context_object = cpu_context->InstanceTemplate ();
   cpu_context_object->SetInternalFieldCount (3);
-  auto cpu_context_signature = AccessorSignature::New (isolate, cpu_context);
-  self->cpu_context =
-      new GumPersistent<FunctionTemplate>::type (isolate, cpu_context);
+  self->cpu_context = new Global<FunctionTemplate> (isolate, cpu_context);
 
 #define GUM_DEFINE_CPU_CONTEXT_ACCESSOR_GPR_ALIASED(A, R) \
     cpu_context_object->SetAccessor ( \
@@ -601,8 +617,7 @@ _gum_v8_core_init (GumV8Core * self,
         Integer::NewFromUnsigned (isolate, \
             G_STRUCT_OFFSET (GumCpuContext, R)), \
         DEFAULT, \
-        DontDelete, \
-        cpu_context_signature)
+        DontDelete)
 #define GUM_DEFINE_CPU_CONTEXT_ACCESSOR_GPR(R) \
     GUM_DEFINE_CPU_CONTEXT_ACCESSOR_GPR_ALIASED (R, R)
 
@@ -615,8 +630,7 @@ _gum_v8_core_init (GumV8Core * self,
             G_STRUCT_OFFSET (GumCpuContext, R) << 8 | \
               sizeof (((GumCpuContext *) NULL)->R)), \
         DEFAULT, \
-        DontDelete, \
-        cpu_context_signature)
+        DontDelete)
 
 #define GUM_DEFINE_CPU_CONTEXT_ACCESSOR_DOUBLE(A, R) \
     cpu_context_object->SetAccessor ( \
@@ -626,8 +640,7 @@ _gum_v8_core_init (GumV8Core * self,
         Integer::NewFromUnsigned (isolate, \
             G_STRUCT_OFFSET (GumCpuContext, R)), \
         DEFAULT, \
-        DontDelete, \
-        cpu_context_signature)
+        DontDelete)
 
 #define GUM_DEFINE_CPU_CONTEXT_ACCESSOR_FLOAT(A, R) \
     cpu_context_object->SetAccessor ( \
@@ -637,8 +650,7 @@ _gum_v8_core_init (GumV8Core * self,
         Integer::NewFromUnsigned (isolate, \
             G_STRUCT_OFFSET (GumCpuContext, R)), \
         DEFAULT, \
-        DontDelete, \
-        cpu_context_signature)
+        DontDelete)
 
 #define GUM_DEFINE_CPU_CONTEXT_ACCESSOR_FLAGS(A, R) \
     cpu_context_object->SetAccessor ( \
@@ -648,8 +660,7 @@ _gum_v8_core_init (GumV8Core * self,
         Integer::NewFromUnsigned (isolate, \
             G_STRUCT_OFFSET (GumCpuContext, R)), \
         DEFAULT, \
-        DontDelete, \
-        cpu_context_signature)
+        DontDelete)
 
 #if defined (HAVE_I386) && GLIB_SIZEOF_VOID_P == 4
   GUM_DEFINE_CPU_CONTEXT_ACCESSOR_GPR_ALIASED (pc, eip);
@@ -975,14 +986,12 @@ _gum_v8_core_init (GumV8Core * self,
 
   auto match_pattern = _gum_v8_create_class ("MatchPattern",
       gumjs_match_pattern_construct, scope, module, isolate);
-  self->match_pattern =
-      new GumPersistent<FunctionTemplate>::type (isolate, match_pattern);
+  self->match_pattern = new Global<FunctionTemplate> (isolate, match_pattern);
 
   auto source_map = _gum_v8_create_class ("SourceMap",
       gumjs_source_map_construct, scope, module, isolate);
   _gum_v8_class_add (source_map, gumjs_source_map_functions, module, isolate);
-  self->source_map =
-      new GumPersistent<FunctionTemplate>::type (isolate, source_map);
+  self->source_map = new Global<FunctionTemplate> (isolate, source_map);
 
   gum_exceptor_add (self->exceptor, gum_v8_core_handle_crashed_js, self);
 }
@@ -1054,59 +1063,52 @@ _gum_v8_core_realize (GumV8Core * self)
   auto int64 = Local<FunctionTemplate>::New (isolate, *self->int64);
   auto int64_value = int64->GetFunction (context).ToLocalChecked ()
       ->NewInstance (context, 1, &zero).ToLocalChecked ();
-  self->int64_value = new GumPersistent<Object>::type (isolate, int64_value);
+  self->int64_value = new Global<Object> (isolate, int64_value);
 
   auto uint64 = Local<FunctionTemplate>::New (isolate, *self->uint64);
   auto uint64_value = uint64->GetFunction (context).ToLocalChecked ()
       ->NewInstance (context, 1, &zero).ToLocalChecked ();
-  self->uint64_value = new GumPersistent<Object>::type (isolate, uint64_value);
+  self->uint64_value = new Global<Object> (isolate, uint64_value);
 
   auto native_pointer = Local<FunctionTemplate>::New (isolate,
       *self->native_pointer);
   auto native_pointer_value = native_pointer->GetFunction (context)
       .ToLocalChecked ()->NewInstance (context, 1, &zero).ToLocalChecked ();
-  self->native_pointer_value = new GumPersistent<Object>::type (isolate,
+  self->native_pointer_value = new Global<Object> (isolate,
       native_pointer_value);
-  self->handle_key = new GumPersistent<String>::type (isolate,
+  self->handle_key = new Global<String> (isolate,
       _gum_v8_string_new_ascii (isolate, "handle"));
 
-  self->abi_key = new GumPersistent<String>::type (isolate,
+  self->abi_key = new Global<String> (isolate,
       _gum_v8_string_new_ascii (isolate, "abi"));
-  self->scheduling_key = new GumPersistent<String>::type (isolate,
+  self->scheduling_key = new Global<String> (isolate,
       _gum_v8_string_new_ascii (isolate, "scheduling"));
-  self->exceptions_key = new GumPersistent<String>::type (isolate,
+  self->exceptions_key = new Global<String> (isolate,
       _gum_v8_string_new_ascii (isolate, "exceptions"));
-  self->traps_key = new GumPersistent<String>::type (isolate,
+  self->traps_key = new Global<String> (isolate,
       _gum_v8_string_new_ascii (isolate, "traps"));
   auto value_key = _gum_v8_string_new_ascii (isolate, "value");
-  self->value_key = new GumPersistent<String>::type (isolate, value_key);
+  self->value_key = new Global<String> (isolate, value_key);
   auto system_error_key =
       _gum_v8_string_new_ascii (isolate, GUMJS_SYSTEM_ERROR_FIELD);
-  self->system_error_key = new GumPersistent<String>::type (isolate,
-      system_error_key);
+  self->system_error_key = new Global<String> (isolate, system_error_key);
 
   auto native_return_value = Object::New (isolate);
   native_return_value->Set (context, value_key, zero).Check ();
   native_return_value->Set (context, system_error_key, zero).Check ();
-  self->native_return_value = new GumPersistent<Object>::type (isolate,
-      native_return_value);
+  self->native_return_value = new Global<Object> (isolate, native_return_value);
 
   auto callback_context = Local<FunctionTemplate>::New (isolate,
       *self->callback_context);
   auto callback_context_value = callback_context->GetFunction (context)
       .ToLocalChecked ()->NewInstance (context, 0, nullptr).ToLocalChecked ();
-  self->callback_context_value = new GumPersistent<Object>::type (isolate,
+  self->callback_context_value = new Global<Object> (isolate,
       callback_context_value);
 
   auto cpu_context = Local<FunctionTemplate>::New (isolate, *self->cpu_context);
-  Local<Value> args[] = {
-    External::New (isolate, NULL),
-    Boolean::New (isolate, false)
-  };
   auto cpu_context_value = cpu_context->GetFunction (context).ToLocalChecked ()
-      ->NewInstance (context, G_N_ELEMENTS (args), args).ToLocalChecked ();
-  self->cpu_context_value = new GumPersistent<Object>::type (isolate,
-      cpu_context_value);
+      ->NewInstance (context).ToLocalChecked ();
+  self->cpu_context_value = new Global<Object> (isolate, cpu_context_value);
 }
 
 gboolean
@@ -1405,7 +1407,7 @@ gum_v8_core_schedule_callback (GumV8Core * self,
   else
     source = g_timeout_source_new ((guint) delay);
   auto callback = gum_v8_scheduled_callback_new (id, repeat, source, self);
-  callback->func = new GumPersistent<Function>::type (self->isolate, func);
+  callback->func = new Global<Function> (self->isolate, func);
   g_source_set_callback (source, (GSourceFunc) gum_v8_scheduled_callback_invoke,
       callback, (GDestroyNotify) gum_v8_scheduled_callback_free);
 
@@ -1638,10 +1640,9 @@ GUMJS_DEFINE_FUNCTION (gumjs_frida_objc_load)
   bool loaded = false;
 
 #ifdef HAVE_OBJC_BRIDGE
-  auto platform = (GumV8Platform *) gum_v8_script_backend_get_platform (
-      core->script->backend);
-
-  gum_v8_bundle_run (platform->GetObjCBundle ());
+  auto bundle = gum_v8_bundle_new (isolate, gumjs_objc_modules);
+  gum_v8_bundle_run (bundle);
+  gum_v8_bundle_free (bundle);
 
   loaded = true;
 #endif
@@ -1654,10 +1655,9 @@ GUMJS_DEFINE_FUNCTION (gumjs_frida_swift_load)
   bool loaded = false;
 
 #ifdef HAVE_SWIFT_BRIDGE
-  auto platform = (GumV8Platform *) gum_v8_script_backend_get_platform (
-      core->script->backend);
-
-  gum_v8_bundle_run (platform->GetSwiftBundle ());
+  auto bundle = gum_v8_bundle_new (isolate, gumjs_swift_modules);
+  gum_v8_bundle_run (bundle);
+  gum_v8_bundle_free (bundle);
 
   loaded = true;
 #endif
@@ -1670,15 +1670,93 @@ GUMJS_DEFINE_FUNCTION (gumjs_frida_java_load)
   bool loaded = false;
 
 #ifdef HAVE_JAVA_BRIDGE
-  auto platform = (GumV8Platform *) gum_v8_script_backend_get_platform (
-      core->script->backend);
-
-  gum_v8_bundle_run (platform->GetJavaBundle ());
+  auto bundle = gum_v8_bundle_new (isolate, gumjs_java_modules);
+  gum_v8_bundle_run (bundle);
+  gum_v8_bundle_free (bundle);
 
   loaded = true;
 #endif
 
   info.GetReturnValue ().Set (loaded);
+}
+
+GUMJS_DEFINE_FUNCTION (gumjs_script_evaluate)
+{
+  gchar * name, * source;
+  if (!_gum_v8_args_parse (args, "ss", &name, &source))
+    return;
+
+  auto context = isolate->GetCurrentContext ();
+
+  auto source_str = String::NewFromUtf8 (isolate, source).ToLocalChecked ();
+
+  auto resource_name = String::NewFromUtf8 (isolate, name).ToLocalChecked ();
+  ScriptOrigin origin (isolate, resource_name);
+
+  Local<Script> code;
+  gchar * error_description = NULL;
+  int line = -1;
+  {
+    TryCatch trycatch (isolate);
+    auto maybe_code = Script::Compile (context, source_str, &origin);
+    if (!maybe_code.ToLocal (&code))
+    {
+      error_description =
+          _gum_v8_error_get_message (isolate, trycatch.Exception ());
+      line = trycatch.Message ()->GetLineNumber (context).FromMaybe (-1);
+    }
+  }
+  if (error_description != NULL)
+  {
+    _gum_v8_throw (isolate,
+        "could not parse '%s' line %d: %s",
+        name,
+        line,
+        error_description);
+    g_free (error_description);
+  }
+
+  if (!code.IsEmpty ())
+  {
+    gchar * source_map = gum_query_script_for_inline_source_map (isolate, code);
+    if (source_map != NULL)
+    {
+      _gum_v8_script_register_source_map (core->script, name,
+          (gchar *) g_steal_pointer (&source_map));
+    }
+
+    Local<Value> result;
+    auto maybe_result = code->Run (context);
+    if (maybe_result.ToLocal (&result))
+      info.GetReturnValue ().Set (result);
+  }
+
+  g_free (source);
+  g_free (name);
+}
+
+GUMJS_DEFINE_FUNCTION (gumjs_script_load)
+{
+  gchar * name, * source;
+  if (!_gum_v8_args_parse (args, "ss", &name, &source))
+    return;
+
+  _gum_v8_script_load_module (core->script, name, source);
+
+  g_free (source);
+  g_free (name);
+}
+
+GUMJS_DEFINE_FUNCTION (gumjs_script_register_source_map)
+{
+  gchar * name, * json;
+  if (!_gum_v8_args_parse (args, "ss", &name, &json))
+    return;
+
+  _gum_v8_script_register_source_map (core->script, name,
+      (gchar *) g_steal_pointer (&json));
+
+  g_free (name);
 }
 
 GUMJS_DEFINE_FUNCTION (gumjs_script_find_source_map)
@@ -1709,37 +1787,12 @@ GUMJS_DEFINE_FUNCTION (gumjs_script_find_source_map)
   {
     if (g_strcmp0 (name, program->global_filename) == 0)
     {
-      auto code = Local<Script>::New (isolate, *program->global_code);
-
-      auto url_value = code->GetUnboundScript ()->GetSourceMappingURL ();
-      if (url_value->IsString ())
-      {
-        String::Utf8Value url_utf8 (isolate, url_value);
-        auto url = *url_utf8;
-
-        auto base64_start = strstr (url, "base64,");
-
-        if (g_str_has_prefix (url, "data:application/json;") &&
-            base64_start != NULL)
-        {
-          base64_start += 7;
-
-          gsize size;
-          auto data = (gchar *) g_base64_decode (base64_start, &size);
-          if (data != NULL && g_utf8_validate (data, size, NULL))
-          {
-            json_malloc_data = g_strndup (data, size);
-            json = json_malloc_data;
-          }
-          g_free (data);
-        }
-      }
+      json_malloc_data = gum_query_script_for_inline_source_map (isolate,
+          Local<Script>::New (isolate, *program->global_code));
+      json = json_malloc_data;
     }
     else
     {
-      auto platform = (GumV8Platform *) gum_v8_script_backend_get_platform (
-          core->script->backend);
-
       if (strcmp (name, "/_frida.js") == 0)
       {
         json = core->runtime_source_map;
@@ -1747,19 +1800,19 @@ GUMJS_DEFINE_FUNCTION (gumjs_script_find_source_map)
 #ifdef HAVE_OBJC_BRIDGE
       else if (strcmp (name, "/_objc.js") == 0)
       {
-        json = platform->GetObjCSourceMap ();
+        json = gumjs_objc_source_map;
       }
 #endif
 #ifdef HAVE_SWIFT_BRIDGE
       else if (strcmp (name, "/_swift.js") == 0)
       {
-        json = platform->GetSwiftSourceMap ();
+        json = gumjs_swift_source_map;
       }
 #endif
 #ifdef HAVE_JAVA_BRIDGE
       else if (strcmp (name, "/_java.js") == 0)
       {
-        json = platform->GetJavaSourceMap ();
+        json = gumjs_java_source_map;
       }
 #endif
     }
@@ -1778,6 +1831,37 @@ GUMJS_DEFINE_FUNCTION (gumjs_script_find_source_map)
 
   g_free (json_malloc_data);
   g_free (name);
+}
+
+static gchar *
+gum_query_script_for_inline_source_map (Isolate * isolate,
+                                        Local<Script> script)
+{
+  auto url_value = script->GetUnboundScript ()->GetSourceMappingURL ();
+  if (!url_value->IsString ())
+    return NULL;
+
+  String::Utf8Value url_utf8 (isolate, url_value);
+  auto url = *url_utf8;
+
+  if (!g_str_has_prefix (url, "data:application/json;"))
+    return NULL;
+
+  auto base64_start = strstr (url, "base64,");
+  if (base64_start == NULL)
+    return NULL;
+  base64_start += 7;
+
+  gchar * result;
+  gsize size;
+  auto data = (gchar *) g_base64_decode (base64_start, &size);
+  if (data != NULL && g_utf8_validate (data, size, NULL))
+    result = g_strndup (data, size);
+  else
+    result = NULL;
+  g_free (data);
+
+  return result;
 }
 
 GUMJS_DEFINE_FUNCTION (gumjs_script_next_tick)
@@ -1839,10 +1923,10 @@ gum_v8_weak_ref_new (guint id,
   auto ref = g_slice_new (GumV8WeakRef);
 
   ref->id = id;
-  ref->target = new GumPersistent<Value>::type (core->isolate, target);
+  ref->target = new Global<Value> (core->isolate, target);
   ref->target->SetWeak (ref, gum_v8_weak_ref_on_weak_notify,
       WeakCallbackType::kParameter);
-  ref->callback = new GumPersistent<Function>::type (core->isolate, callback);
+  ref->callback = new Global<Function> (core->isolate, callback);
 
   ref->core = core;
 
@@ -1915,8 +1999,8 @@ gum_v8_core_invoke_pending_weak_callbacks (GumV8Core * self,
 
   auto recv = Undefined (isolate);
 
-  GumPersistent<Function>::type * weak_callback;
-  while ((weak_callback = (GumPersistent<Function>::type *)
+  Global<Function> * weak_callback;
+  while ((weak_callback = (Global<Function> *)
       g_queue_pop_head (&self->pending_weak_callbacks)) != nullptr)
   {
     auto callback = Local<Function>::New (isolate, *weak_callback);
@@ -1948,10 +2032,9 @@ GUMJS_DEFINE_FUNCTION (gumjs_script_set_global_access_handler)
 
   if (has_callbacks)
   {
-    core->on_global_get = new GumPersistent<Function>::type (isolate,
-        on_get.As<Function> ());
-    core->global_receiver = new GumPersistent<Object>::type (isolate,
-        callbacks);
+    core->on_global_get =
+        new Global<Function> (isolate, on_get.As<Function> ());
+    core->global_receiver = new Global<Object> (isolate, callbacks);
   }
 }
 
@@ -2192,7 +2275,8 @@ GUMJS_DEFINE_CONSTRUCTOR (gumjs_native_pointer_construct)
   if (!_gum_v8_args_parse (args, "p~", &ptr))
     return;
 
-  wrapper->SetInternalField (0, External::New (isolate, ptr));
+  wrapper->SetInternalField (0,
+      BigInt::NewFromUnsigned (isolate, GPOINTER_TO_SIZE (ptr)));
 }
 
 GUMJS_DEFINE_FUNCTION (gumjs_native_pointer_is_null)
@@ -2773,11 +2857,11 @@ gumjs_native_function_init (Local<Object> wrapper,
     func->arglist_size += t->size;
   }
 
-  wrapper->SetInternalField (0, External::New (isolate,
-      (void *) func->implementation));
+  wrapper->SetInternalField (0, BigInt::NewFromUnsigned (isolate,
+        GPOINTER_TO_SIZE (func->implementation)));
   wrapper->SetAlignedPointerInInternalField (1, func);
 
-  func->wrapper = new GumPersistent<Object>::type (isolate, wrapper);
+  func->wrapper = new Global<Object> (isolate, wrapper);
   func->wrapper->SetWeak (func, gum_v8_native_function_on_weak_notify,
       WeakCallbackType::kParameter);
 
@@ -3214,7 +3298,7 @@ GUMJS_DEFINE_CONSTRUCTOR (gumjs_native_callback_construct)
 
   callback = g_slice_new0 (GumV8NativeCallback);
   callback->ref_count = 1;
-  callback->func = new GumPersistent<Function>::type (isolate, func_value);
+  callback->func = new Global<Function> (isolate, func_value);
   callback->core = core;
 
   if (!gum_v8_ffi_type_get (core, rtype_value, &rtype, &callback->data))
@@ -3262,10 +3346,11 @@ GUMJS_DEFINE_CONSTRUCTOR (gumjs_native_callback_construct)
     goto error;
   }
 
-  wrapper->SetInternalField (0, External::New (isolate, func));
+  wrapper->SetInternalField (0,
+      BigInt::NewFromUnsigned (isolate, GPOINTER_TO_SIZE (func)));
   wrapper->SetInternalField (1, External::New (isolate, callback));
 
-  callback->wrapper = new GumPersistent<Object>::type (isolate, wrapper);
+  callback->wrapper = new Global<Object> (isolate, wrapper);
   callback->wrapper->SetWeak (callback,
       gum_v8_native_callback_on_weak_notify, WeakCallbackType::kParameter);
 
@@ -3471,11 +3556,11 @@ gum_v8_callback_context_new_persistent (GumV8Core * core,
       *core->callback_context_value);
   auto wrapper = callback_context_value->Clone ();
   wrapper->SetAlignedPointerInInternalField (0, jcc);
-  jcc->wrapper = new GumPersistent<Object>::type (isolate, wrapper);
+  jcc->wrapper = new Global<Object> (isolate, wrapper);
   jcc->return_address = 0;
   jcc->raw_return_address = raw_return_address;
 
-  jcc->cpu_context = new GumPersistent<Object>::type (isolate,
+  jcc->cpu_context = new Global<Object> (isolate,
       _gum_v8_cpu_context_new_immutable (cpu_context, core));
 
   return jcc;
@@ -3495,8 +3580,8 @@ GUMJS_DEFINE_CLASS_GETTER (gumjs_callback_context_get_return_address,
   if (self->return_address == 0)
   {
     auto instance (Local<Object>::New (isolate, *self->cpu_context));
-    auto cpu_context = (GumCpuContext *)
-        instance->GetInternalField (0).As<External> ()->Value ();
+    auto cpu_context =
+        (GumCpuContext *) instance->GetAlignedPointerFromInternalField (0);
 
     auto backtracer = gum_backtracer_make_accurate ();
 
@@ -3536,12 +3621,12 @@ GUMJS_DEFINE_CLASS_GETTER (gumjs_callback_context_get_cpu_context,
 
 GUMJS_DEFINE_CONSTRUCTOR (gumjs_cpu_context_construct)
 {
-  GumCpuContext * cpu_context;
-  gboolean is_mutable;
-  if (!_gum_v8_args_parse (args, "Xt", &cpu_context, &is_mutable))
+  GumCpuContext * cpu_context = NULL;
+  gboolean is_mutable = FALSE;
+  if (!_gum_v8_args_parse (args, "|Xt", &cpu_context, &is_mutable))
     return;
 
-  wrapper->SetInternalField (0, External::New (isolate, cpu_context));
+  wrapper->SetAlignedPointerInInternalField (0, cpu_context);
   wrapper->SetInternalField (1, Boolean::New (isolate, !!is_mutable));
   wrapper->SetAlignedPointerInInternalField (2, core);
 }
@@ -3552,8 +3637,7 @@ gumjs_cpu_context_get_gpr (Local<Name> property,
 {
   auto wrapper = info.Holder ();
   auto core = (GumV8Core *) wrapper->GetAlignedPointerFromInternalField (2);
-  auto cpu_context =
-      (guint8 *) wrapper->GetInternalField (0).As<External> ()->Value ();
+  auto cpu_context = (guint8 *) wrapper->GetAlignedPointerFromInternalField (0);
   const gsize offset = info.Data ().As<Integer> ()->Value ();
 
   info.GetReturnValue ().Set (
@@ -3568,8 +3652,7 @@ gumjs_cpu_context_set_gpr (Local<Name> property,
   auto isolate = info.GetIsolate ();
   auto wrapper = info.Holder ();
   auto core = (GumV8Core *) wrapper->GetAlignedPointerFromInternalField (2);
-  auto cpu_context =
-      (guint8 *) wrapper->GetInternalField (0).As<External> ()->Value ();
+  auto cpu_context = (guint8 *) wrapper->GetAlignedPointerFromInternalField (0);
   bool is_mutable = wrapper->GetInternalField (1).As<Boolean> ()->Value ();
   const gsize offset = info.Data ().As<Integer> ()->Value ();
 
@@ -3593,8 +3676,7 @@ gumjs_cpu_context_get_vector (Local<Name> property,
                               const PropertyCallbackInfo<Value> & info)
 {
   auto wrapper = info.Holder ();
-  auto cpu_context =
-      (guint8 *) wrapper->GetInternalField (0).As<External> ()->Value ();
+  auto cpu_context = (guint8 *) wrapper->GetAlignedPointerFromInternalField (0);
   gsize spec = info.Data ().As<Integer> ()->Value ();
   const gsize offset = spec >> 8;
   const gsize size = spec & 0xff;
@@ -3614,8 +3696,7 @@ gumjs_cpu_context_set_vector (Local<Name> property,
   auto isolate = info.GetIsolate ();
   auto wrapper = info.Holder ();
   auto core = (GumV8Core *) wrapper->GetAlignedPointerFromInternalField (2);
-  auto cpu_context =
-      (guint8 *) wrapper->GetInternalField (0).As<External> ()->Value ();
+  auto cpu_context = (guint8 *) wrapper->GetAlignedPointerFromInternalField (0);
   bool is_mutable = wrapper->GetInternalField (1).As<Boolean> ()->Value ();
   gsize spec = info.Data ().As<Integer> ()->Value ();
   const gsize offset = spec >> 8;
@@ -3651,8 +3732,7 @@ gumjs_cpu_context_get_double (Local<Name> property,
                               const PropertyCallbackInfo<Value> & info)
 {
   auto wrapper = info.Holder ();
-  auto cpu_context =
-      (guint8 *) wrapper->GetInternalField (0).As<External> ()->Value ();
+  auto cpu_context = (guint8 *) wrapper->GetAlignedPointerFromInternalField (0);
   const gsize offset = info.Data ().As<Integer> ()->Value ();
 
   info.GetReturnValue ().Set (
@@ -3666,8 +3746,7 @@ gumjs_cpu_context_set_double (Local<Name> property,
 {
   auto isolate = info.GetIsolate ();
   auto wrapper = info.Holder ();
-  auto cpu_context =
-      (guint8 *) wrapper->GetInternalField (0).As<External> ()->Value ();
+  auto cpu_context = (guint8 *) wrapper->GetAlignedPointerFromInternalField (0);
   bool is_mutable = wrapper->GetInternalField (1).As<Boolean> ()->Value ();
   const gsize offset = info.Data ().As<Integer> ()->Value ();
 
@@ -3692,8 +3771,7 @@ gumjs_cpu_context_get_float (Local<Name> property,
                              const PropertyCallbackInfo<Value> & info)
 {
   auto wrapper = info.Holder ();
-  auto cpu_context =
-      (guint8 *) wrapper->GetInternalField (0).As<External> ()->Value ();
+  auto cpu_context = (guint8 *) wrapper->GetAlignedPointerFromInternalField (0);
   const gsize offset = info.Data ().As<Integer> ()->Value ();
 
   info.GetReturnValue ().Set (
@@ -3707,8 +3785,7 @@ gumjs_cpu_context_set_float (Local<Name> property,
 {
   auto isolate = info.GetIsolate ();
   auto wrapper = info.Holder ();
-  auto cpu_context =
-      (guint8 *) wrapper->GetInternalField (0).As<External> ()->Value ();
+  auto cpu_context = (guint8 *) wrapper->GetAlignedPointerFromInternalField (0);
   bool is_mutable = wrapper->GetInternalField (1).As<Boolean> ()->Value ();
   const gsize offset = info.Data ().As<Integer> ()->Value ();
 
@@ -3733,8 +3810,7 @@ gumjs_cpu_context_get_flags (Local<Name> property,
                              const PropertyCallbackInfo<Value> & info)
 {
   auto wrapper = info.Holder ();
-  auto cpu_context =
-      (guint8 *) wrapper->GetInternalField (0).As<External> ()->Value ();
+  auto cpu_context = (guint8 *) wrapper->GetAlignedPointerFromInternalField (0);
   const gsize offset = info.Data ().As<Integer> ()->Value ();
 
   info.GetReturnValue ().Set (
@@ -3749,8 +3825,7 @@ gumjs_cpu_context_set_flags (Local<Name> property,
 {
   auto isolate = info.GetIsolate ();
   auto wrapper = info.Holder ();
-  auto cpu_context =
-      (guint8 *) wrapper->GetInternalField (0).As<External> ()->Value ();
+  auto cpu_context = (guint8 *) wrapper->GetAlignedPointerFromInternalField (0);
   bool is_mutable = wrapper->GetInternalField (1).As<Boolean> ()->Value ();
   auto core = (GumV8Core *) wrapper->GetAlignedPointerFromInternalField (2);
   const gsize offset = info.Data ().As<Integer> ()->Value ();
@@ -3806,7 +3881,7 @@ gum_v8_match_pattern_new (Local<Object> wrapper,
 {
   auto pattern = g_slice_new (GumV8MatchPattern);
 
-  pattern->wrapper = new GumPersistent<Object>::type (core->isolate, wrapper);
+  pattern->wrapper = new Global<Object> (core->isolate, wrapper);
   pattern->handle = handle;
 
   g_hash_table_add (core->match_patterns, pattern);
@@ -3919,7 +3994,7 @@ gum_v8_source_map_new (Local<Object> wrapper,
                        GumV8Core * core)
 {
   auto map = g_slice_new (GumV8SourceMap);
-  map->wrapper = new GumPersistent<Object>::type (core->isolate, wrapper);
+  map->wrapper = new Global<Object> (core->isolate, wrapper);
   map->wrapper->SetWeak (map, gum_v8_source_map_on_weak_notify,
       WeakCallbackType::kParameter);
   map->handle = handle;
@@ -3954,7 +4029,7 @@ gum_v8_exception_sink_new (Local<Function> callback,
                            Isolate * isolate)
 {
   auto sink = g_slice_new (GumV8ExceptionSink);
-  sink->callback = new GumPersistent<Function>::type (isolate, callback);
+  sink->callback = new Global<Function> (isolate, callback);
   sink->isolate = isolate;
   return sink;
 }
@@ -3986,7 +4061,7 @@ gum_v8_message_sink_new (Local<Function> callback,
                          Isolate * isolate)
 {
   auto sink = g_slice_new (GumV8MessageSink);
-  sink->callback = new GumPersistent<Function>::type (isolate, callback);
+  sink->callback = new Global<Function> (isolate, callback);
   sink->isolate = isolate;
   return sink;
 }

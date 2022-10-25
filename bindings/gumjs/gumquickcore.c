@@ -170,6 +170,11 @@ GUMJS_DECLARE_FUNCTION (gumjs_frida_objc_load)
 GUMJS_DECLARE_FUNCTION (gumjs_frida_swift_load)
 GUMJS_DECLARE_FUNCTION (gumjs_frida_java_load)
 
+GUMJS_DECLARE_FUNCTION (gumjs_script_evaluate)
+GUMJS_DECLARE_FUNCTION (gumjs_script_load)
+GUMJS_DECLARE_FUNCTION (gumjs_script_register_source_map)
+static JSValue gumjs_rethrow_parse_error_with_decorations (JSContext * ctx,
+    const gchar * name);
 GUMJS_DECLARE_FUNCTION (gumjs_script_find_source_map)
 GUMJS_DECLARE_FUNCTION (gumjs_script_next_tick)
 GUMJS_DECLARE_FUNCTION (gumjs_script_pin)
@@ -384,6 +389,9 @@ static const JSCFunctionListEntry gumjs_frida_entries[] =
 static const JSCFunctionListEntry gumjs_script_entries[] =
 {
   JS_PROP_STRING_DEF ("runtime", "QJS", JS_PROP_C_W_E),
+  JS_CFUNC_DEF ("evaluate", 0, gumjs_script_evaluate),
+  JS_CFUNC_DEF ("_load", 0, gumjs_script_load),
+  JS_CFUNC_DEF ("registerSourceMap", 0, gumjs_script_register_source_map),
   JS_CFUNC_DEF ("_findSourceMap", 0, gumjs_script_find_source_map),
   JS_CFUNC_DEF ("_nextTick", 0, gumjs_script_next_tick),
   JS_CFUNC_DEF ("pin", 0, gumjs_script_pin),
@@ -2011,6 +2019,105 @@ GUMJS_DEFINE_FUNCTION (gumjs_frida_java_load)
 #endif
 
   return loaded;
+}
+
+GUMJS_DEFINE_FUNCTION (gumjs_script_evaluate)
+{
+  const gchar * name, * source;
+  JSValue func;
+  gchar * source_map;
+
+  if (!_gum_quick_args_parse (args, "ss", &name, &source))
+    return JS_EXCEPTION;
+
+  func = JS_Eval (ctx, source, strlen (source), name,
+      JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT | JS_EVAL_FLAG_COMPILE_ONLY);
+  if (JS_IsException (func))
+    return gumjs_rethrow_parse_error_with_decorations (ctx, name);
+
+  source_map = gum_script_backend_extract_inline_source_map (source);
+  if (source_map != NULL)
+  {
+    gchar * map_name = g_strconcat (name, ".map", NULL);
+    g_hash_table_insert (core->program->es_assets, map_name,
+        gum_es_asset_new_take (map_name, source_map, strlen (source_map)));
+  }
+
+  return JS_EvalFunction (ctx, func);
+}
+
+GUMJS_DEFINE_FUNCTION (gumjs_script_load)
+{
+  GHashTable * es_assets = core->program->es_assets;
+  const gchar * name, * source;
+  JSValue module;
+  gchar * name_copy, * source_map;
+
+  if (!_gum_quick_args_parse (args, "ss", &name, &source))
+    return JS_EXCEPTION;
+
+  if (g_hash_table_contains (es_assets, name))
+    return _gum_quick_throw (ctx, "module '%s' already exists", name);
+
+  module = JS_Eval (ctx, source, strlen (source), name,
+      JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_STRICT | JS_EVAL_FLAG_COMPILE_ONLY);
+  if (JS_IsException (module))
+    return gumjs_rethrow_parse_error_with_decorations (ctx, name);
+
+  name_copy = g_strdup (name);
+  g_hash_table_insert (es_assets, name_copy,
+      gum_es_asset_new_take (name_copy, NULL, 0));
+
+  source_map = gum_script_backend_extract_inline_source_map (source);
+  if (source_map != NULL)
+  {
+    gchar * map_name = g_strconcat (name, ".map", NULL);
+    g_hash_table_insert (es_assets, map_name,
+        gum_es_asset_new_take (map_name, source_map, strlen (source_map)));
+  }
+
+  return JS_EvalFunction (ctx, module);
+}
+
+static JSValue
+gumjs_rethrow_parse_error_with_decorations (JSContext * ctx,
+                                            const gchar * name)
+{
+  JSValue exception_val, message_val, line_val;
+  const char * message;
+  uint32_t line;
+
+  exception_val = JS_GetException (ctx);
+  message_val = JS_GetPropertyStr (ctx, exception_val, "message");
+  line_val = JS_GetPropertyStr (ctx, exception_val, "lineNumber");
+
+  message = JS_ToCString (ctx, message_val);
+  JS_ToUint32 (ctx, &line, line_val);
+
+  _gum_quick_throw (ctx, "could not parse '%s' line %u: %s",
+      name, line, message);
+
+  JS_FreeCString (ctx, message);
+  JS_FreeValue (ctx, line_val);
+  JS_FreeValue (ctx, message_val);
+  JS_FreeValue (ctx, exception_val);
+
+  return JS_EXCEPTION;
+}
+
+GUMJS_DEFINE_FUNCTION (gumjs_script_register_source_map)
+{
+  const gchar * name, * json;
+  gchar * map_name;
+
+  if (!_gum_quick_args_parse (args, "ss", &name, &json))
+    return JS_EXCEPTION;
+
+  map_name = g_strconcat (name, ".map", NULL);
+  g_hash_table_insert (core->program->es_assets, map_name,
+      gum_es_asset_new_take (map_name, g_strdup (json), strlen (json)));
+
+  return JS_UNDEFINED;
 }
 
 GUMJS_DEFINE_FUNCTION (gumjs_script_find_source_map)

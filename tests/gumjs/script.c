@@ -429,6 +429,25 @@ TESTLIST_BEGIN (script)
     TESTENTRY (esm_in_subdir_should_be_supported)
     TESTENTRY (esm_referencing_subdir_should_be_supported)
     TESTENTRY (esm_referencing_parent_should_be_supported)
+    TESTENTRY (esm_throwing_on_load_should_emit_error)
+    TESTENTRY (esm_throwing_after_toplevel_await_should_emit_error)
+    TESTENTRY (esm_referencing_missing_module_should_fail_to_load)
+  TESTGROUP_END ()
+
+  TESTGROUP_BEGIN ("Dynamic")
+    TESTENTRY (dynamic_script_evaluation_should_be_supported)
+    TESTENTRY (dynamic_script_evaluation_should_throw_on_syntax_error)
+    TESTENTRY (dynamic_script_evaluation_should_throw_on_runtime_error)
+    TESTENTRY (dynamic_script_loading_should_be_supported)
+    TESTENTRY (dynamic_script_loading_should_throw_on_syntax_error)
+    TESTENTRY (dynamic_script_loading_should_throw_on_runtime_error)
+    TESTENTRY (dynamic_script_loading_should_throw_on_error_with_toplevel_await)
+    TESTENTRY (dynamic_script_loading_should_throw_on_dupe_load_attempt)
+    TESTENTRY (dynamic_script_should_support_imports_from_parent)
+    TESTENTRY (dynamic_script_should_support_imports_from_other_dynamic_scripts)
+    TESTENTRY (dynamic_script_evaluated_should_support_inline_source_map)
+    TESTENTRY (dynamic_script_loaded_should_support_inline_source_map)
+    TESTENTRY (dynamic_script_loaded_should_support_separate_source_map)
   TESTGROUP_END ()
 
   TESTENTRY (script_can_be_compiled_to_bytecode)
@@ -531,8 +550,8 @@ static int compare_measurements (gconstpointer element_a,
 
 static gboolean check_exception_handling_testable (void);
 
-static void on_script_message (GumScript * script, const gchar * message,
-    GBytes * data, gpointer user_data);
+static void on_script_message (const gchar * message, GBytes * data,
+    gpointer user_data);
 static void on_incoming_debug_message (GumInspectorServer * server,
     const gchar * message, gpointer user_data);
 static void on_outgoing_debug_message (const gchar * message,
@@ -4641,6 +4660,9 @@ TESTCASE (process_should_support_nested_signal_handling)
 #ifdef HAVE_LINUX
   gpointer page;
 
+  if (!check_exception_handling_testable ())
+    return;
+
   page = gum_alloc_n_pages (1, GUM_PAGE_NO_ACCESS);
 
   COMPILE_AND_LOAD_SCRIPT ("Process.setExceptionHandler(details => {"
@@ -5419,10 +5441,10 @@ TESTCASE (invalid_script_should_return_null)
   GError * err = NULL;
 
   g_assert_null (gum_script_backend_create_sync (fixture->backend, "testcase",
-      "'", NULL, NULL));
+      "'", NULL, NULL, NULL));
 
   g_assert_null (gum_script_backend_create_sync (fixture->backend, "testcase",
-      "'", NULL, &err));
+      "'", NULL, NULL, &err));
   g_assert_nonnull (err);
   g_assert_true (g_str_has_prefix (err->message,
       "Script(line 1): SyntaxError: "));
@@ -7115,6 +7137,9 @@ TESTCASE (memory_can_be_scanned_asynchronously)
   EXPECT_SEND_MESSAGE_WITH ("\"onMatch offset=5 size=2\"");
   EXPECT_SEND_MESSAGE_WITH ("\"DONE\"");
 
+  if (!check_exception_handling_testable ())
+    return;
+
   COMPILE_AND_LOAD_SCRIPT (
       "async function run() {"
       "  try {"
@@ -7219,6 +7244,9 @@ TESTCASE (memory_access_can_be_monitored)
   volatile guint8 * a, * b;
   guint page_size;
 
+  if (!check_exception_handling_testable ())
+    return;
+
   a = gum_alloc_n_pages (2, GUM_PAGE_RW);
   b = gum_alloc_n_pages (1, GUM_PAGE_RW);
   page_size = gum_query_page_size ();
@@ -7255,6 +7283,9 @@ TESTCASE (memory_access_can_be_monitored_one_range)
 {
   volatile guint8 * a;
   guint page_size;
+
+  if (!check_exception_handling_testable ())
+    return;
 
   a = gum_alloc_n_pages (2, GUM_PAGE_RW);
   page_size = gum_query_page_size ();
@@ -9414,14 +9445,15 @@ TESTCASE (script_can_be_compiled_to_bytecode)
   {
     g_assert_null (code);
     g_assert_nonnull (error);
-    g_assert_cmpstr (error->message, ==, "not yet supported by the V8 runtime");
+    g_assert_cmpstr (error->message, ==,
+        "compilation to bytecode is not supported by the V8 runtime");
     g_clear_error (&error);
 
     code = g_bytes_new (NULL, 0);
   }
 
   script = gum_script_backend_create_from_bytes_sync (fixture->backend, code,
-      NULL, &error);
+      NULL, NULL, &error);
   if (GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend))
   {
     TestScriptMessageItem * item;
@@ -9450,7 +9482,8 @@ TESTCASE (script_can_be_compiled_to_bytecode)
   {
     g_assert_null (script);
     g_assert_nonnull (error);
-    g_assert_cmpstr (error->message, ==, "not yet supported by the V8 runtime");
+    g_assert_cmpstr (error->message, ==,
+        "script creation from bytecode is not supported by the V8 runtime");
     g_clear_error (&error);
   }
 
@@ -9467,7 +9500,7 @@ TESTCASE (script_should_not_leak_if_destroyed_before_load)
   ref_count_before = G_OBJECT (held_instance)->ref_count;
 
   script = gum_script_backend_create_sync (fixture->backend, "testcase",
-      "console.log('Hello World');", NULL, NULL);
+      "console.log('Hello World');", NULL, NULL, NULL);
   g_object_unref (script);
 
   g_assert_cmpuint (G_OBJECT (held_instance)->ref_count, ==, ref_count_before);
@@ -9488,7 +9521,7 @@ TESTCASE (script_memory_usage)
 
   /* Warm up */
   script = gum_script_backend_create_sync (fixture->backend, "testcase",
-      "const foo = 42;", NULL, NULL);
+      "const foo = 42;", NULL, NULL, NULL);
   gum_script_load_sync (script, NULL);
   gum_script_unload_sync (script, NULL);
   g_object_unref (script);
@@ -9499,7 +9532,7 @@ TESTCASE (script_memory_usage)
 
   g_timer_reset (timer);
   script = gum_script_backend_create_sync (fixture->backend, "testcase",
-      "const foo = 42;", NULL, NULL);
+      "const foo = 42;", NULL, NULL, NULL);
   g_print ("created in %u ms\n",
       (guint) (g_timer_elapsed (timer, NULL) * 1000.0));
 
@@ -9573,6 +9606,430 @@ TESTCASE (esm_referencing_parent_should_be_supported)
       "✄\n"
       "export const value = 1337;\n");
   EXPECT_SEND_MESSAGE_WITH ("{\"value\":1337}");
+}
+
+TESTCASE (esm_throwing_on_load_should_emit_error)
+{
+  COMPILE_AND_LOAD_SCRIPT (
+      "📦\n"
+      "6 /main.js\n"
+      "✄\n"
+      "oops;\n");
+  EXPECT_ERROR_MESSAGE_WITH (ANY_LINE_NUMBER,
+      GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend)
+        ? "ReferenceError: 'oops' is not defined"
+        : "ReferenceError: oops is not defined");
+}
+
+TESTCASE (esm_throwing_after_toplevel_await_should_emit_error)
+{
+  if (GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend))
+  {
+    g_print ("<not available on QuickJS> ");
+    return;
+  }
+
+  COMPILE_AND_LOAD_SCRIPT (
+      "📦\n"
+      "122 /main.js\n"
+      "✄\n"
+      "await sleep(10);\n"
+      "oops;\n"
+      "\n"
+      "function sleep(duration) {\n"
+      "  return new Promise(resolve => { setTimeout(resolve, duration); });\n"
+      "}\n");
+  EXPECT_ERROR_MESSAGE_WITH (ANY_LINE_NUMBER,
+      GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend)
+        ? "ReferenceError: 'oops' is not defined"
+        : "ReferenceError: oops is not defined");
+}
+
+TESTCASE (esm_referencing_missing_module_should_fail_to_load)
+{
+  const gchar * source =
+      "📦\n"
+      "41 /main.js\n"
+      "✄\n"
+      "import { value } from './dependency.js';\n";
+  GError * error = NULL;
+
+  g_assert_null (gum_script_backend_create_sync (fixture->backend,
+      "testcase", source, NULL, NULL, &error));
+  g_assert_nonnull (error);
+  g_assert_cmpstr (error->message, ==,
+      "Could not load module '/dependency.js'");
+  g_error_free (error);
+}
+
+TESTCASE (dynamic_script_evaluation_should_be_supported)
+{
+  COMPILE_AND_LOAD_SCRIPT (
+      "const result = Script.evaluate('/x.js', 'const x = 42; 1337;');"
+      "send([result, x]);");
+  EXPECT_SEND_MESSAGE_WITH ("[1337,42]");
+  EXPECT_NO_MESSAGES ();
+}
+
+TESTCASE (dynamic_script_evaluation_should_throw_on_syntax_error)
+{
+  COMPILE_AND_LOAD_SCRIPT ("Script.evaluate('/x.js', 'const x = \\'');");
+  EXPECT_ERROR_MESSAGE_WITH (ANY_LINE_NUMBER,
+      GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend)
+        ? "Error: could not parse '/x.js' line 1: unexpected end of string"
+        : "Error: could not parse '/x.js' line 1: Invalid or unexpected token");
+}
+
+TESTCASE (dynamic_script_evaluation_should_throw_on_runtime_error)
+{
+  COMPILE_AND_LOAD_SCRIPT ("Script.evaluate('/x.js', 'x');");
+  EXPECT_ERROR_MESSAGE_WITH (ANY_LINE_NUMBER,
+      GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend)
+        ? "ReferenceError: 'x' is not defined"
+        : "ReferenceError: x is not defined");
+}
+
+TESTCASE (dynamic_script_loading_should_be_supported)
+{
+  COMPILE_AND_LOAD_SCRIPT (
+      "async function main() {"
+        "const m = await Script.load('/x.js',"
+            "'export const x = 42; send(\\'A\\');');"
+        "send(typeof x);"
+        "send(m.x);"
+      "}"
+      "main().catch(e => send(e.stack));");
+  EXPECT_SEND_MESSAGE_WITH ("\"A\"");
+  EXPECT_SEND_MESSAGE_WITH ("\"undefined\"");
+  EXPECT_SEND_MESSAGE_WITH ("42");
+  EXPECT_NO_MESSAGES ();
+}
+
+TESTCASE (dynamic_script_loading_should_throw_on_syntax_error)
+{
+  COMPILE_AND_LOAD_SCRIPT (
+      "Script.load('/x.js', 'const x = \\'')"
+          ".catch(e => { send(e.message); });");
+  EXPECT_SEND_MESSAGE_WITH (
+      GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend)
+        ? "\"could not parse '/x.js' line 1: unexpected end of string\""
+        : "\"could not parse '/x.js' line 1: Invalid or unexpected token\"");
+}
+
+TESTCASE (dynamic_script_loading_should_throw_on_runtime_error)
+{
+  COMPILE_AND_LOAD_SCRIPT (
+      "Script.load('/x.js', 'x')"
+          ".catch(e => { send(e.message); });");
+  EXPECT_SEND_MESSAGE_WITH (
+      GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend)
+        ? "\"'x' is not defined\""
+        : "\"x is not defined\"");
+}
+
+TESTCASE (dynamic_script_loading_should_throw_on_error_with_toplevel_await)
+{
+  if (GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend))
+  {
+    g_print ("<not available on QuickJS> ");
+    return;
+  }
+
+  COMPILE_AND_LOAD_SCRIPT (
+      "Script.load('/x.js',"
+          "`"
+            "await sleep(10);\n"
+            "x;\n"
+            "\n"
+            "function sleep(duration) {\n"
+              "return new Promise(resolve => {\n"
+                "setTimeout(resolve, duration);\n"
+              "});\n"
+            "}\n"
+          "`)"
+          ".catch(e => { send(e.message); });");
+  EXPECT_SEND_MESSAGE_WITH (
+      GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend)
+        ? "\"'x' is not defined\""
+        : "\"x is not defined\"");
+}
+
+TESTCASE (dynamic_script_loading_should_throw_on_dupe_load_attempt)
+{
+  COMPILE_AND_LOAD_SCRIPT (
+      "async function main() {"
+        "await Script.load('/x.js', 'true');"
+        "Script.load('/x.js', 'true').catch(e => { send(e.message); });"
+      "}"
+      "main().catch(e => { Script.nextTick(() => { throw e; }); });");
+  EXPECT_SEND_MESSAGE_WITH ("\"module '/x.js' already exists\"");
+}
+
+TESTCASE (dynamic_script_should_support_imports_from_parent)
+{
+  const gchar * source =
+      "export const value = 1337;"
+
+      "async function main() {"
+        "await Script.load('/plugin.js', `"
+          "import { value } from '/main.js';"
+          "send(value);"
+        "`);"
+      "}"
+
+      "main().catch(e => send(e.stack));";
+
+  COMPILE_AND_LOAD_SCRIPT (
+      "📦\n"
+      "%u /main.js\n"
+      "✄\n"
+      "%s",
+      (guint) strlen (source),
+      source);
+  EXPECT_SEND_MESSAGE_WITH ("1337");
+  EXPECT_NO_MESSAGES ();
+}
+
+TESTCASE (dynamic_script_should_support_imports_from_other_dynamic_scripts)
+{
+  COMPILE_AND_LOAD_SCRIPT (
+      "async function main() {"
+        "await Script.load('/dependency.js', 'export const value = 1337;');"
+        "await Script.load('/main.js', `"
+          "import { value } from './dependency.js';"
+          "send(value);"
+        "`);"
+      "}"
+      "main().catch(e => send(e.stack));");
+  EXPECT_SEND_MESSAGE_WITH ("1337");
+  EXPECT_NO_MESSAGES ();
+}
+
+TESTCASE (dynamic_script_evaluated_should_support_inline_source_map)
+{
+  TestScriptMessageItem * item;
+
+  /*
+   * agent/index.ts
+   * --------
+   * 01 import * as math from "./math";
+   * 02
+   * 03 try {
+   * 04     math.add(3, 4);
+   * 05 } catch (e) {
+   * 06     send((e as Error).stack);
+   * 07 }
+   *
+   * agent/math.ts
+   * -------
+   * 01 export function add(a: number, b: number): number {
+   * 02     throw new Error("not yet implemented");
+   * 03 }
+   */
+  COMPILE_AND_LOAD_SCRIPT (
+      "Script.evaluate('/user.js', `(function(){function r(e,n,t){function o(i,"
+        "f){if(!n[i]){if(!e[i]){var c=\"function\"==typeof require&&require;if("
+        "!f&&c)return c(i,!0);if(u)return u(i,!0);var a=new Error(\"Cannot find"
+        " module '\"+i+\"'\");throw a.code=\"MODULE_NOT_FOUND\",a}var p=n[i]={e"
+        "xports:{}};e[i][0].call(p.exports,function(r){var n=e[i][1][r];return "
+        "o(n||r)},p,p.exports,r,e,n,t)}return n[i].exports}for(var u=\"function"
+        "\"==typeof require&&require,i=0;i<t.length;i++)o(t[i]);return o}return"
+        " r})()({1:[function(require,module,exports){\n"
+        "\"use strict\";\n"
+        "Object.defineProperty(exports, \"__esModule\", { value: true });\n"
+        "const math = require(\"./math\");\n"
+        "try {\n"
+        "    math.add(3, 4);\n"
+        "}\n"
+        "catch (e) {\n"
+        "    send(e.stack);\n"
+        "}\n"
+        "\n"
+        "},{\"./math\":2}],2:[function(require,module,exports){\n"
+        "\"use strict\";\n"
+        "Object.defineProperty(exports, \"__esModule\", { value: true });\n"
+        "exports.add = void 0;\n"
+        "function add(a, b) {\n"
+        "    throw new Error(\"not yet implemented\");\n"
+        "}\n"
+        "exports.add = add;\n"
+        "\n"
+        "},{}]},{},[1])\n"
+        "//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZX"
+        "JzaW9uIjozLCJzb3VyY2VzIjpbIm5vZGVfbW9kdWxlcy9icm93c2VyLXBhY2svX3ByZWx1"
+        "ZGUuanMiLCJhZ2VudC9pbmRleC50cyIsImFnZW50L21hdGgudHMiXSwibmFtZXMiOltdLC"
+        "JtYXBwaW5ncyI6IkFBQUE7OztBQ0FBLCtCQUErQjtBQUUvQixJQUFJO0lBQ0EsSUFBSSxD"
+        "QUFDLEdBQUcsQ0FBQyxDQUFDLEVBQUUsQ0FBQyxDQUFDLENBQUM7Q0FDbEI7QUFBQyxPQU"
+        "FPLENBQUMsRUFBRTtJQUNSLElBQUksQ0FBRSxDQUFXLENBQUMsS0FBSyxDQUFDLENBQUM7"
+        "Q0FDNUI7Ozs7OztBQ05ELFNBQWdCLEdBQUcsQ0FBQyxDQUFTLEVBQUUsQ0FBUztJQUNwQy"
+        "xNQUFNLElBQUksS0FBSyxDQUFDLHFCQUFxQixDQUFDLENBQUM7QUFDM0MsQ0FBQztBQUZE"
+        "LGtCQUVDIiwiZmlsZSI6ImdlbmVyYXRlZC5qcyIsInNvdXJjZVJvb3QiOiIifQ==\n"
+      "`);");
+
+  item = test_script_fixture_pop_message (fixture);
+  g_assert_nonnull (strstr (item->message, "\"type\":\"send\""));
+  if (GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend))
+  {
+    g_assert_nonnull (strstr (item->message,
+        "\"payload\":\"Error: not yet implemented\\n"
+        "    at add (agent/math.ts:2)\\n"
+        "    at <anonymous> (agent/index.ts:4)\\n"
+        "    at call (native)\\n"
+        "    at o (node_modules/browser-pack/_prelude.js:1)\\n"
+        "    at r (node_modules/browser-pack/_prelude.js:1)\\n"
+        "    at <eval> (/user.js:21)"));
+  }
+  else
+  {
+    g_assert_nonnull (strstr (item->message,
+        "\"payload\":\"Error: not yet implemented\\n"
+        "    at Object.add (agent/math.ts:2:11)\\n"
+        "    at Object.1../math (agent/index.ts:4:10)\\n"
+        "    at o (node_modules/browser-pack/_prelude.js:1:1)\\n"
+        "    at r (node_modules/browser-pack/_prelude.js:1:1)\\n"
+        "    at node_modules/browser-pack/_prelude.js:1:1"));
+  }
+  test_script_message_item_free (item);
+}
+
+TESTCASE (dynamic_script_loaded_should_support_inline_source_map)
+{
+  TestScriptMessageItem * item;
+
+  /*
+   * agent/index.ts
+   * --------
+   * 01 import * as math from "./math.js";
+   * 02
+   * 03 try {
+   * 04     math.add(3, 4);
+   * 05 } catch (e) {
+   * 06     send((e as Error).stack);
+   * 07 }
+   *
+   * agent/math.ts
+   * -------
+   * 01 export function add(a: number, b: number): number {
+   * 02     throw new Error("not yet implemented");
+   * 03 }
+   */
+  COMPILE_AND_LOAD_SCRIPT (
+      "async function main() {"
+        "await Script.load('/agent/math.js', `"
+          "export function add(a, b) {\n"
+          "    throw new Error(\"not yet implemented\");\n"
+          "}\n"
+          "//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2"
+          "ZXJzaW9uIjozLCJmaWxlIjoibWF0aC5qcyIsInNvdXJjZVJvb3QiOiIvVXNlcnMvb2xl"
+          "YXZyL3NyYy9mcmlkYS1hZ2VudC1leGFtcGxlLyIsInNvdXJjZXMiOlsiYWdlbnQvbWF0"
+          "aC50cyJdLCJuYW1lcyI6W10sIm1hcHBpbmdzIjoiQUFBQSxNQUFNLFVBQVUsR0FBRyxD"
+          "QUFDLENBQVMsRUFBRSxDQUFTO0lBQ3BDLE1BQU0sSUFBSSxLQUFLLENBQUMscUJBQXFC"
+          "LENBQUMsQ0FBQztBQUMzQyxDQUFDIn0=\n"
+        "`);"
+        "await Script.load('/agent/index.js', `"
+          "import * as math from \"./math.js\";\n"
+          "try {\n"
+          "    math.add(3, 4);\n"
+          "}\n"
+          "catch (e) {\n"
+          "    send(e.stack);\n"
+          "}\n"
+          "//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2"
+          "ZXJzaW9uIjozLCJmaWxlIjoiaW5kZXguanMiLCJzb3VyY2VSb290IjoiL1VzZXJzL29s"
+          "ZWF2ci9zcmMvZnJpZGEtYWdlbnQtZXhhbXBsZS8iLCJzb3VyY2VzIjpbImFnZW50L2lu"
+          "ZGV4LnRzIl0sIm5hbWVzIjpbXSwibWFwcGluZ3MiOiJBQUFBLE9BQU8sS0FBSyxJQUFJ"
+          "LE1BQU0sV0FBVyxDQUFDO0FBRWxDLElBQUk7SUFDQSxJQUFJLENBQUMsR0FBRyxDQUFD"
+          "LENBQUMsRUFBRSxDQUFDLENBQUMsQ0FBQztDQUNsQjtBQUFDLE9BQU8sQ0FBQyxFQUFF"
+          "O0lBQ1IsSUFBSSxDQUFFLENBQVcsQ0FBQyxLQUFLLENBQUMsQ0FBQztDQUM1QiJ9\n"
+        "`);"
+      "}"
+      "main().catch(e => send(e.stack));");
+
+  item = test_script_fixture_pop_message (fixture);
+  g_assert_nonnull (strstr (item->message, "\"type\":\"send\""));
+  if (GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend))
+  {
+    g_assert_nonnull (strstr (item->message,
+        "\"payload\":\"Error: not yet implemented\\n"
+        "    at add (agent/math.ts:2)\\n"
+        "    at <anonymous> (agent/index.ts:4)"));
+  }
+  else
+  {
+    g_assert_nonnull (strstr (item->message,
+        "\"payload\":\"Error: not yet implemented\\n"
+        "    at Module.add (agent/math.ts:2:11)\\n"
+        "    at agent/index.ts:4:10"));
+  }
+  test_script_message_item_free (item);
+}
+
+TESTCASE (dynamic_script_loaded_should_support_separate_source_map)
+{
+  TestScriptMessageItem * item;
+
+  /*
+   * agent/index.ts
+   * --------
+   * 01 import * as math from "./math.js";
+   * 02
+   * 03 try {
+   * 04     math.add(3, 4);
+   * 05 } catch (e) {
+   * 06     send((e as Error).stack);
+   * 07 }
+   *
+   * agent/math.ts
+   * -------
+   * 01 export function add(a: number, b: number): number {
+   * 02     throw new Error("not yet implemented");
+   * 03 }
+   */
+  COMPILE_AND_LOAD_SCRIPT (
+      "async function main() {"
+        "Script.registerSourceMap('/agent/math.js', `{\"version\":3,\"file\":\""
+          "math.js\",\"sourceRoot\":\"/Users/oleavr/src/frida-agent-example/\","
+          "\"sources\":[\"agent/math.ts\"],\"names\":[],\"mappings\":\"AAAA,MAA"
+          "M,UAAU,GAAG,CAAC,CAAS,EAAE,CAAS;IACpC,MAAM,IAAI,KAAK,CAAC,qBAAqB,CAA"
+          "C,CAAC;AAC3C,CAAC\"}`);"
+        "await Script.load('/agent/math.js', `"
+          "export function add(a, b) {\n"
+          "    throw new Error(\"not yet implemented\");\n"
+          "}\n`);"
+        "Script.registerSourceMap('/agent/index.js', `{\"version\":3,\"file\":"
+          "\"index.js\",\"sourceRoot\":\"/Users/oleavr/src/frida-agent-example/"
+          "\",\"sources\":[\"agent/index.ts\"],\"names\":[],\"mappings\":\"AAAA"
+          ",OAAO,KAAK,IAAI,MAAM,WAAW,CAAC;AAElC,IAAI;IACA,IAAI,CAAC,GAAG,CAAC,C"
+          "AAC,EAAE,CAAC,CAAC,CAAC;CAClB;AAAC,OAAO,CAAC,EAAE;IACR,IAAI,CAAE,CAA"
+          "W,CAAC,KAAK,CAAC,CAAC;CAC5B\"}`);"
+        "await Script.load('/agent/index.js', `"
+          "import * as math from \"./math.js\";\n"
+          "try {\n"
+          "    math.add(3, 4);\n"
+          "}\n"
+          "catch (e) {\n"
+          "    send(e.stack);\n"
+          "}\n`);"
+      "}"
+      "main().catch(e => send(e.stack));");
+
+  item = test_script_fixture_pop_message (fixture);
+  g_assert_nonnull (strstr (item->message, "\"type\":\"send\""));
+  if (GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend))
+  {
+    g_assert_nonnull (strstr (item->message,
+        "\"payload\":\"Error: not yet implemented\\n"
+        "    at add (agent/math.ts:2)\\n"
+        "    at <anonymous> (agent/index.ts:4)"));
+  }
+  else
+  {
+    g_assert_nonnull (strstr (item->message,
+        "\"payload\":\"Error: not yet implemented\\n"
+        "    at Module.add (agent/math.ts:2:11)\\n"
+        "    at agent/index.ts:4:10"));
+  }
+  test_script_message_item_free (item);
 }
 
 TESTCASE (source_maps_should_be_supported_for_our_runtime)
@@ -9861,19 +10318,13 @@ TESTCASE (globals_can_be_dynamically_generated)
   EXPECT_NO_MESSAGES ();
 
   COMPILE_AND_LOAD_SCRIPT (
-      "let totalGetCalls = 0;"
       "Script.setGlobalAccessHandler({"
       "  get(property) {"
-      "    totalGetCalls++;"
       "  },"
       "});"
       "(1, eval)('mushroom = 42;');"
-      "send(totalGetCalls);"
-      "send(mushroom);"
-      "send(totalGetCalls);");
-  EXPECT_SEND_MESSAGE_WITH ("0");
+      "send(mushroom);");
   EXPECT_SEND_MESSAGE_WITH ("42");
-  EXPECT_SEND_MESSAGE_WITH ("0");
   EXPECT_NO_MESSAGES ();
 }
 
@@ -9906,8 +10357,8 @@ TESTCASE (exceptions_can_be_handled)
 
 TESTCASE (debugger_can_be_enabled)
 {
-  GumScript * badger, * snake;
   GumInspectorServer * server;
+  GumScript * script;
   GError * error;
 
   if (GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend))
@@ -9922,25 +10373,18 @@ TESTCASE (debugger_can_be_enabled)
     return;
   }
 
-  badger = gum_script_backend_create_sync (fixture->backend, "badger",
-      "const badgerTimer = setInterval(() => {\n"
-      "  send('badger');\n"
-      "}, 1000);", NULL, NULL);
-  gum_script_set_message_handler (badger, on_script_message, "badger", NULL);
-  gum_script_load_sync (badger, NULL);
-
-  snake = gum_script_backend_create_sync (fixture->backend, "snake",
-      "const snakeTimer = setInterval(() => {\n"
-      "  send('snake');\n"
-      "}, 1000);", NULL, NULL);
-  gum_script_set_message_handler (snake, on_script_message, "snake", NULL);
-  gum_script_load_sync (snake, NULL);
-
   server = gum_inspector_server_new ();
   g_signal_connect (server, "message", G_CALLBACK (on_incoming_debug_message),
       fixture->backend);
-  gum_script_backend_set_debug_message_handler (fixture->backend,
-      on_outgoing_debug_message, server, NULL);
+
+  script = gum_script_backend_create_sync (fixture->backend, "script",
+      "const scriptTimer = setInterval(() => {\n"
+      "  send('hello');\n"
+      "}, 1000);", NULL, NULL, NULL);
+  gum_script_set_message_handler (script, on_script_message, "script", NULL);
+  gum_script_set_debug_message_handler (script, on_outgoing_debug_message,
+      server, NULL);
+  gum_script_load_sync (script, NULL);
 
   error = NULL;
   if (gum_inspector_server_start (server, &error))
@@ -9962,10 +10406,8 @@ TESTCASE (debugger_can_be_enabled)
     g_error_free (error);
   }
 
+  g_object_unref (script);
   g_object_unref (server);
-
-  g_object_unref (snake);
-  g_object_unref (badger);
 }
 
 TESTCASE (objc_api_is_embedded)
@@ -9999,8 +10441,7 @@ check_exception_handling_testable (void)
 }
 
 static void
-on_script_message (GumScript * script,
-                   const gchar * message,
+on_script_message (const gchar * message,
                    GBytes * data,
                    gpointer user_data)
 {
@@ -10013,9 +10454,9 @@ on_incoming_debug_message (GumInspectorServer * server,
                            const gchar * message,
                            gpointer user_data)
 {
-  GumScriptBackend * backend = user_data;
+  GumScript * script = user_data;
 
-  gum_script_backend_post_debug_message (backend, message);
+  gum_script_post_debug_message (script, message);
 }
 
 static void

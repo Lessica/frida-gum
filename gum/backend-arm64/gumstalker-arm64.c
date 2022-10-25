@@ -1428,6 +1428,7 @@ gum_stalker_infect (GumThreadId thread_id,
   gum_spinlock_release (&ctx->code_lock);
 
   gum_event_sink_start (ctx->sink);
+  ctx->sink_started = TRUE;
 
   cpu_context->pc = ctx->infect_body;
 }
@@ -2456,29 +2457,15 @@ gum_exec_ctx_query_block_switch_callback (GumExecCtx * ctx,
                                           gpointer from_insn,
                                           gpointer * target)
 {
-  cs_insn * insn = NULL;
-  gpointer from = NULL;
+  gpointer from;
 
   if (ctx->observer == NULL)
     return;
 
-  /*
-   * In the event of a block continuation (e.g. we had to split the generated
-   * code for a single basic block into two separate instrumented blocks (e.g.
-   * because of size), then we may have no from_insn here. Just pass NULL to the
-   * callback and let the user decide what to do.
-   */
-  if (from_insn != NULL)
-    insn = gum_arm64_reader_disassemble_instruction_at (from_insn);
-
-  if (block != NULL)
-    from = block->real_start;
+  from = (block != NULL) ? block->real_start : NULL;
 
   gum_stalker_observer_switch_callback (ctx->observer, from, start_address,
-      insn, target);
-
-  if (insn != NULL)
-    cs_free (insn, 1);
+      from_insn, target);
 }
 
 static void
@@ -3290,10 +3277,10 @@ gum_exec_ctx_write_prolog_helper (GumExecCtx * ctx,
       if (i == 19)
       {
         /*
-         * X19 has been stored above our CpuContext by the prologue code, we reach
-         * up and grab it here and copy it to the right place in the context. Here
-         * we use X28 as scratch since it has already been saved in the context
-         * above.
+         * X19 has been stored above our CpuContext by the prologue code, we
+         * reach up and grab it here and copy it to the right place in the
+         * context. Here we use X28 as scratch since it has already been saved
+         * in the context above.
          */
         gum_arm64_writer_put_ldr_reg_reg_offset (cw, ARM64_REG_X28,
             ARM64_REG_X19, distance_to_top);

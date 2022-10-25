@@ -145,7 +145,8 @@ gboolean
 gum_code_segment_is_supported (void)
 {
 #if (defined (HAVE_MACOS) && defined (HAVE_ARM64)) || defined (HAVE_IOS)
-  return TRUE;
+  /* Not going to work on newer kernels, such as on iOS >= 15.6.1. */
+  return !gum_darwin_check_xnu_version (8020, 142, 0);
 #else
   return FALSE;
 #endif

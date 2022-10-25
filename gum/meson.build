@@ -267,6 +267,7 @@ if host_arch == 'arm64'
     'backend-arm64/gumspinlock-arm64.c',
     'backend-arm64/gumstalker-arm64.c',
     'backend-arm64/gumstalker-arm64-glue.S',
+    'backend-arm64/memcpy-advsimd.S',
   ]
 endif
 
@@ -317,10 +318,8 @@ gum_enums = gnome.mkenums('gum-enum-types',
   install_dir: get_option('includedir') / install_header_subdir,
   install_header: true,
 )
-
-gum_enums_dep = declare_dependency(sources: gum_enums)
-
 gum_enum_h = gum_enums[1]
+gum_enums_dep = declare_dependency(sources: [gum_enum_h])
 
 gum_public_deps = [glib_dep, capstone_dep, gum_enums_dep]
 gum_internal_deps = [glib_dep, capstone_dep, threads_dep]
