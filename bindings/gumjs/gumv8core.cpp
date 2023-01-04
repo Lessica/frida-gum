@@ -2,7 +2,7 @@
  * Copyright (C) 2010-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2015 Asger Hautop Drewsen <asgerdrewsen@gmail.com>
  * Copyright (C) 2015 Marc Hartmayer <hello@hartmayer.com>
- * Copyright (C) 2020-2021 Francesco Tamagni <mrmacete@protonmail.ch>
+ * Copyright (C) 2020-2022 Francesco Tamagni <mrmacete@protonmail.ch>
  * Copyright (C) 2020 Marcus Mengs <mame8282@googlemail.com>
  * Copyright (C) 2021 Abdelrahman Eid <hot3eed@gmail.com>
  *
@@ -26,6 +26,7 @@
 # include "gumv8script-java.h"
 #endif
 
+#include <glib/gprintf.h>
 #ifdef _MSC_VER
 # include <intrin.h>
 #endif
@@ -108,6 +109,7 @@ enum _GumV8ExceptionsBehavior
 enum _GumV8CodeTraps
 {
   GUM_V8_CODE_TRAPS_DEFAULT,
+  GUM_V8_CODE_TRAPS_NONE,
   GUM_V8_CODE_TRAPS_ALL
 };
 
@@ -2132,11 +2134,11 @@ GUMJS_DEFINE_FUNCTION (gumjs_int64_to_string)
 
   gchar str[32];
   if (radix == 10)
-    sprintf (str, "%" G_GINT64_FORMAT, value);
+    g_sprintf (str, "%" G_GINT64_FORMAT, value);
   else if (value >= 0)
-    sprintf (str, "%" G_GINT64_MODIFIER "x", value);
+    g_sprintf (str, "%" G_GINT64_MODIFIER "x", value);
   else
-    sprintf (str, "-%" G_GINT64_MODIFIER "x", -value);
+    g_sprintf (str, "-%" G_GINT64_MODIFIER "x", -value);
 
   info.GetReturnValue ().Set (_gum_v8_string_new_ascii (isolate, str));
 }
@@ -2144,7 +2146,7 @@ GUMJS_DEFINE_FUNCTION (gumjs_int64_to_string)
 GUMJS_DEFINE_FUNCTION (gumjs_int64_to_json)
 {
   gchar str[32];
-  sprintf (str, "%" G_GINT64_FORMAT, _gum_v8_int64_get_value (info.Holder ()));
+  g_sprintf (str, "%" G_GINT64_FORMAT, _gum_v8_int64_get_value (info.Holder ()));
 
   info.GetReturnValue ().Set (_gum_v8_string_new_ascii (isolate, str));
 }
@@ -2239,9 +2241,9 @@ GUMJS_DEFINE_FUNCTION (gumjs_uint64_to_string)
 
   gchar str[32];
   if (radix == 10)
-    sprintf (str, "%" G_GUINT64_FORMAT, value);
+    g_sprintf (str, "%" G_GUINT64_FORMAT, value);
   else
-    sprintf (str, "%" G_GINT64_MODIFIER "x", value);
+    g_sprintf (str, "%" G_GINT64_MODIFIER "x", value);
 
   info.GetReturnValue ().Set (_gum_v8_string_new_ascii (isolate, str));
 }
@@ -2249,7 +2251,7 @@ GUMJS_DEFINE_FUNCTION (gumjs_uint64_to_string)
 GUMJS_DEFINE_FUNCTION (gumjs_uint64_to_json)
 {
   gchar str[32];
-  sprintf (str, "%" G_GUINT64_FORMAT,
+  g_sprintf (str, "%" G_GUINT64_FORMAT,
       _gum_v8_uint64_get_value (info.Holder ()));
 
   info.GetReturnValue ().Set (_gum_v8_string_new_ascii (isolate, str));
@@ -2474,14 +2476,14 @@ GUMJS_DEFINE_FUNCTION (gumjs_native_pointer_to_string)
   gchar str[32];
   if (radix == 10)
   {
-    sprintf (str, "%" G_GSIZE_MODIFIER "u", ptr);
+    g_sprintf (str, "%" G_GSIZE_MODIFIER "u", ptr);
   }
   else
   {
     if (radix_specified)
-      sprintf (str, "%" G_GSIZE_MODIFIER "x", ptr);
+      g_sprintf (str, "%" G_GSIZE_MODIFIER "x", ptr);
     else
-      sprintf (str, "0x%" G_GSIZE_MODIFIER "x", ptr);
+      g_sprintf (str, "0x%" G_GSIZE_MODIFIER "x", ptr);
   }
 
   info.GetReturnValue ().Set (_gum_v8_string_new_ascii (isolate, str));
@@ -2492,7 +2494,7 @@ GUMJS_DEFINE_FUNCTION (gumjs_native_pointer_to_json)
   gsize ptr = GPOINTER_TO_SIZE (GUMJS_NATIVE_POINTER_VALUE (info.Holder ()));
 
   gchar str[32];
-  sprintf (str, "0x%" G_GSIZE_MODIFIER "x", ptr);
+  g_sprintf (str, "0x%" G_GSIZE_MODIFIER "x", ptr);
 
   info.GetReturnValue ().Set (_gum_v8_string_new_ascii (isolate, str));
 }
@@ -3019,8 +3021,11 @@ gum_v8_native_function_invoke (GumV8NativeFunction * self,
       {
         new (unlocker) ScriptUnlocker (core);
 
-        interceptor_was_ignoring_us =
-            gum_interceptor_maybe_unignore_current_thread (interceptor);
+        if (traps != GUM_V8_CODE_TRAPS_NONE)
+        {
+          interceptor_was_ignoring_us =
+              gum_interceptor_maybe_unignore_current_thread (interceptor);
+        }
       }
 
       if (traps == GUM_V8_CODE_TRAPS_ALL)
@@ -3033,6 +3038,10 @@ gum_v8_native_function_invoke (GumV8NativeFunction * self,
         stalker = _gum_v8_stalker_get (stalker_module);
         gum_stalker_activate (stalker, GUM_FUNCPTR_TO_POINTER (implementation));
       }
+      else if (traps == GUM_V8_CODE_TRAPS_NONE)
+      {
+        gum_interceptor_ignore_current_thread (interceptor);
+      }
 
       ffi_call (cif, FFI_FN (implementation), rvalue, avalue);
 
@@ -3044,9 +3053,12 @@ gum_v8_native_function_invoke (GumV8NativeFunction * self,
 
     g_clear_pointer (&stalker, gum_stalker_deactivate);
 
+    if (traps == GUM_V8_CODE_TRAPS_NONE)
+      gum_interceptor_unignore_current_thread (interceptor);
+
     if (scheduling == GUM_V8_SCHEDULING_COOPERATIVE)
     {
-      if (interceptor_was_ignoring_us)
+      if (traps != GUM_V8_CODE_TRAPS_NONE && interceptor_was_ignoring_us)
         gum_interceptor_ignore_current_thread (interceptor);
 
       unlocker->~ScriptUnlocker ();
@@ -3255,15 +3267,21 @@ gum_v8_code_traps_parse (Local<Value> value,
     String::Utf8Value str_value (isolate, value);
     auto str = *str_value;
 
-    if (strcmp (str, "all") == 0)
-    {
-      *traps = GUM_V8_CODE_TRAPS_ALL;
-      return TRUE;
-    }
-
     if (strcmp (str, "default") == 0)
     {
       *traps = GUM_V8_CODE_TRAPS_DEFAULT;
+      return TRUE;
+    }
+
+    if (strcmp (str, "none") == 0)
+    {
+      *traps = GUM_V8_CODE_TRAPS_NONE;
+      return TRUE;
+    }
+
+    if (strcmp (str, "all") == 0)
+    {
+      *traps = GUM_V8_CODE_TRAPS_ALL;
       return TRUE;
     }
   }

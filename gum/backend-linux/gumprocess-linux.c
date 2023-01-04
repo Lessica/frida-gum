@@ -115,6 +115,7 @@ enum _GumModifyThreadAck
   GUM_ACK_MODIFIED_CONTEXT,
   GUM_ACK_WROTE_CONTEXT,
   GUM_ACK_FAILED_TO_ATTACH,
+  GUM_ACK_FAILED_TO_WAIT,
   GUM_ACK_FAILED_TO_STOP,
   GUM_ACK_FAILED_TO_READ,
   GUM_ACK_FAILED_TO_WRITE,
@@ -551,11 +552,20 @@ gum_do_modify_thread (gpointer data)
     goto failed_to_attach;
   attached = TRUE;
 
-  wait_result = gum_libc_waitpid (ctx->thread_id, &status, 0);
-  if (wait_result != ctx->thread_id || !WIFSTOPPED (status) ||
-      WSTOPSIG (status) != SIGSTOP)
+  wait_result = gum_libc_waitpid (ctx->thread_id, &status, __WALL);
+
+  if (wait_result != ctx->thread_id)
+    goto failed_to_wait;
+
+  if (!WIFSTOPPED (status))
     goto failed_to_stop;
 
+  /*
+   * Although ptrace injects SIGSTOP into our process, it is possible that our
+   * target is stopped by another stop signal (e.g. SIGTTIN). The man pages for
+   * ptrace mention the possible race condition. For our purposes, however, we
+   * only require that the target is stopped so that we can read its registers.
+   */
   res = gum_get_regs (ctx->thread_id, &regs);
   if (res == -1)
     goto failed_to_read;
@@ -568,7 +578,9 @@ gum_do_modify_thread (gpointer data)
   if (res == -1)
     goto failed_to_write;
 
-  res = gum_libc_ptrace (PTRACE_DETACH, ctx->thread_id, NULL, NULL);
+  res = gum_libc_ptrace (PTRACE_DETACH, ctx->thread_id, NULL,
+      GINT_TO_POINTER (SIGCONT));
+
   attached = FALSE;
   if (res == -1)
     goto failed_to_detach;
@@ -580,6 +592,11 @@ gum_do_modify_thread (gpointer data)
 failed_to_attach:
   {
     gum_put_ack (fd, GUM_ACK_FAILED_TO_ATTACH);
+    goto beach;
+  }
+failed_to_wait:
+  {
+    gum_put_ack (fd, GUM_ACK_FAILED_TO_WAIT);
     goto beach;
   }
 failed_to_stop:
@@ -605,7 +622,10 @@ failed_to_detach:
 beach:
   {
     if (attached)
-      gum_libc_ptrace (PTRACE_DETACH, ctx->thread_id, NULL, NULL);
+    {
+      gum_libc_ptrace (PTRACE_DETACH, ctx->thread_id, NULL,
+          GINT_TO_POINTER (SIGCONT));
+    }
 
     return 0;
   }
@@ -1305,6 +1325,38 @@ void
 gum_thread_set_system_error (gint value)
 {
   errno = value;
+}
+
+gboolean
+gum_thread_suspend (GumThreadId thread_id,
+                    GError ** error)
+{
+  if (syscall (__NR_tgkill, getpid (), thread_id, SIGSTOP) != 0)
+    goto failure;
+
+  return TRUE;
+
+failure:
+  {
+    g_set_error (error, GUM_ERROR, GUM_ERROR_FAILED, "%s", g_strerror (errno));
+    return FALSE;
+  }
+}
+
+gboolean
+gum_thread_resume (GumThreadId thread_id,
+                   GError ** error)
+{
+  if (syscall (__NR_tgkill, getpid (), thread_id, SIGCONT) != 0)
+    goto failure;
+
+  return TRUE;
+
+failure:
+  {
+    g_set_error (error, GUM_ERROR, GUM_ERROR_FAILED, "%s", g_strerror (errno));
+    return FALSE;
+  }
 }
 
 gboolean

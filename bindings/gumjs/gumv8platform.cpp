@@ -7,6 +7,7 @@
 #include "gumv8platform.h"
 
 #include "gumscriptbackend.h"
+#include "gumv8scope.h"
 
 #include <algorithm>
 #include <gum/gumcloak.h>
@@ -415,26 +416,6 @@ private:
   GumMutexUnlocker unlocker;
 };
 
-class GumV8InterceptorIgnoreScope
-{
-public:
-  GumV8InterceptorIgnoreScope ()
-  {
-    interceptor = gum_interceptor_obtain ();
-    gum_interceptor_ignore_current_thread (interceptor);
-  }
-
-
-  ~GumV8InterceptorIgnoreScope ()
-  {
-    gum_interceptor_unignore_current_thread (interceptor);
-    g_object_unref (interceptor);
-  }
-
-private:
-  GumInterceptor * interceptor;
-};
-
 GumV8Platform::GumV8Platform ()
   : disposing (false),
     scheduler (gum_script_backend_get_scheduler ()),
@@ -608,13 +589,10 @@ GumV8Platform::OnOperationRemoved (GumV8Operation * op)
       return;
   }
 
-  if (g_main_context_is_owner (gum_script_scheduler_get_js_context (scheduler)))
-    MaybeDisposeIsolate (isolate);
-  else
-    ScheduleOnJSThread (G_PRIORITY_HIGH, [=]()
-        {
-          MaybeDisposeIsolate (isolate);
-        });
+  ScheduleOnJSThread (G_PRIORITY_HIGH, [=]()
+      {
+        MaybeDisposeIsolate (isolate);
+      });
 }
 
 std::shared_ptr<GumV8Operation>
@@ -1331,7 +1309,10 @@ GumV8JobState::Join ()
   GumV8JobState::JobDelegate delegate (this, true);
   while (can_run)
   {
-    job_task->Run (&delegate);
+    {
+      Locker locker (isolate);
+      job_task->Run (&delegate);
+    }
 
     GumMutexLocker locker (&mutex);
     can_run = WaitForParticipationOpportunityLocked ();
@@ -1462,7 +1443,12 @@ GumV8JobState::CallOnWorkerThread (TaskPriority with_priority,
                                    std::unique_ptr<Task> task)
 {
   std::shared_ptr<Task> t (std::move (task));
-  auto op = platform->ScheduleOnThreadPool ([=]() { t->Run (); });
+  Isolate * job_isolate = this->isolate;
+  auto op = platform->ScheduleOnThreadPool ([=]()
+      {
+        Locker locker (job_isolate);
+        t->Run ();
+      });
 
   {
     GumV8PlatformLocker locker (platform);
@@ -1608,7 +1594,7 @@ GumV8PageAllocator::AllocatePages (void * address,
 {
   GumV8InterceptorIgnoreScope interceptor_ignore_scope;
 
-  gpointer base;
+  gpointer base = NULL;
 #ifdef HAVE_DARWIN
   if (permissions == PageAllocator::kNoAccessWillJitLater)
   {
@@ -1619,8 +1605,8 @@ GumV8PageAllocator::AllocatePages (void * address,
     if (base == MAP_FAILED)
       base = NULL;
   }
-  else
 #endif
+  if (base == NULL)
   {
     base = gum_memory_allocate (address, length, alignment,
         gum_page_protection_from_v8 (permissions));

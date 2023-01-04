@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2021 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2008-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2008 Christian Berentsen <jc.berentsen@gmail.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
@@ -15,8 +15,15 @@
 #include "gumtls.h"
 
 typedef struct _GumInterceptorBackend GumInterceptorBackend;
+typedef guint8 GumInterceptorType;
 typedef struct _GumFunctionContext GumFunctionContext;
 typedef union _GumFunctionContextBackendData GumFunctionContextBackendData;
+
+enum _GumInterceptorType
+{
+  GUM_INTERCEPTOR_TYPE_DEFAULT = 0,
+  GUM_INTERCEPTOR_TYPE_FAST    = 1
+};
 
 union _GumFunctionContextBackendData
 {
@@ -28,12 +35,13 @@ struct _GumFunctionContext
 {
   gpointer function_address;
 
-  gboolean destroyed;
-  gboolean activated;
-  gboolean has_on_leave_listener;
-
   gpointer grafted_hook;
   gpointer import_target;
+
+  GumInterceptorType type;
+  guint8 destroyed;
+  guint8 activated;
+  guint8 has_on_leave_listener;
 
   GumCodeSlice * trampoline_slice;
   GumCodeDeflector * trampoline_deflector;
