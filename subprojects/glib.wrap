@@ -1,5 +1,5 @@
 [wrap-git]
-url = https://github.com/frida/glib.git
+url = https://github.com/Lessica/glib.git
 revision = main
 depth = 1
 
