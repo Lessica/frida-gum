@@ -16,8 +16,8 @@ RELAXED_DEPS = {
 }
 
 EXACT_DEPS = {
-    "frida-java-bridge": "6.2.3",
-    "frida-objc-bridge": "git+https://github.com/Lessica/frida-objc-bridge#36e464eba67012c225ce4f010ab801018bcae8be",
+    "frida-java-bridge": "6.2.5",
+    "frida-objc-bridge": "git+https://github.com/Lessica/frida-objc-bridge#5f737583ddce6b88a41b0b77835a053036ca810f",
     "frida-swift-bridge": "2.0.6"
 }
 
@@ -29,7 +29,7 @@ def generate_runtime(backends, arch, endian, input_dir, gum_dir, capstone_incdir
         for f in pkg_files:
             if f.exists():
                 f.unlink()
-        (output_dir / "tsconfig.json").write_text("{ \"files\": [] }", encoding="utf-8")
+        (output_dir / "tsconfig.json").write_text("{ \"files\": [], \"compilerOptions\": { \"typeRoots\": [] } }", encoding="utf-8")
 
         node_modules = output_dir / "node_modules"
         if node_modules.exists():
@@ -146,7 +146,7 @@ def generate_runtime_quick(runtime_name, output_dir, output, inputs, quickcompil
             input_source_map_identifier = "gumjs_{0}_source_map".format(stem_cname)
 
             output_file.write("\nstatic const guint8 {0}[{1}] =\n{{".format(input_bytecode_identifier, bytecode_size))
-            write_bytes(bytecode, output_file)
+            write_bytes(bytecode, output_file, 'unsigned')
             output_file.write("\n};\n")
 
             source_code = input_path.read_text(encoding='utf-8')
@@ -158,11 +158,12 @@ def generate_runtime_quick(runtime_name, output_dir, output, inputs, quickcompil
                 source_map_size = len(source_map_bytes)
 
                 output_file.write("\nstatic const gchar {0}[{1}] =\n{{".format(input_source_map_identifier, source_map_size))
-                write_bytes(source_map_bytes, output_file)
+                write_bytes(source_map_bytes, output_file, 'signed')
                 output_file.write("\n};\n")
 
                 modules.append((input_bytecode_identifier, bytecode_size, input_source_map_identifier))
             else:
+                output_file.write("\nstatic const gchar {0}[1] = {{ 0 }};\n".format(input_source_map_identifier))
                 modules.append((input_bytecode_identifier, bytecode_size, "NULL"))
 
         output_file.write("\nstatic const GumQuickRuntimeModule gumjs_{0}_modules[] =\n{{".format(runtime_name))
@@ -191,7 +192,7 @@ def generate_runtime_v8(runtime_name, output_dir, output, inputs):
             source_code_size = len(source_code_bytes)
 
             output_file.write("\nstatic const gchar {0}[{1}] =\n{{".format(input_source_code_identifier, source_code_size))
-            write_bytes(source_code_bytes, output_file)
+            write_bytes(source_code_bytes, output_file, 'signed')
             output_file.write("\n};\n")
 
             if source_map is not None:
@@ -200,11 +201,12 @@ def generate_runtime_v8(runtime_name, output_dir, output, inputs):
                 source_map_size = len(source_map_bytes)
 
                 output_file.write("\nstatic const gchar {0}[{1}] =\n{{".format(input_source_map_identifier, source_map_size))
-                write_bytes(source_map_bytes, output_file)
+                write_bytes(source_map_bytes, output_file, 'signed')
                 output_file.write("\n};\n")
 
                 modules.append((input_name, input_source_code_identifier, input_source_map_identifier))
             else:
+                output_file.write("\nstatic const gchar {0}[1] = {{ 0 }};\n".format(input_source_map_identifier))
                 modules.append((input_name, input_source_code_identifier, "NULL"))
 
         output_file.write("\nstatic const GumV8RuntimeModule gumjs_{0}_modules[] =\n{{".format(runtime_name))
@@ -214,7 +216,7 @@ def generate_runtime_v8(runtime_name, output_dir, output, inputs):
 
 
 cmodule_function_pattern = re.compile(
-        r"^(void|size_t|int|unsigned int|bool|const char \*|gpointer|gsize|gssize|gint[0-9]*|guint[0-9]*|gfloat|gdouble|gboolean||(?:const )?\w+ \*|Gum\w+|cs_err) ([a-z][a-z0-9_]+)\s?\(",
+        r"^(void|size_t|int|unsigned int|bool|const char \*|gpointer|gsize|gssize|gint[0-9]*|guint[0-9]*|gfloat|gdouble|gboolean||(?:const )?\w+ \*|Gum\w+|csh|cs_err) ([a-z][a-z0-9_]+)\s?\(",
     re.MULTILINE)
 cmodule_variable_pattern = re.compile(r"^(extern .+? )(\w+);", re.MULTILINE)
 capstone_include_pattern = re.compile(r'^#include "(\w+)\.h"$', re.MULTILINE)
@@ -264,10 +266,14 @@ def generate_runtime_cmodule(output_dir, output, arch, input_dir, gum_dir, capst
 
         return "typedef int cs_{0};".format(name)
 
+    def libtcc_is_header(name):
+        """Ignore symbols from the TinyCC standard library: dlclose() etc."""
+        return is_header(name) and name != "tcclib.h"
+
     inputs = [
         (input_dir / "runtime" / "cmodule", None, is_header, identity_transform, 'GUM_CHEADER_FRIDA'),
         (input_dir / "runtime" / "cmodule-tcc", None, is_header, identity_transform, 'GUM_CHEADER_TCC'),
-        (libtcc_incdir, None, is_header, identity_transform, 'GUM_CHEADER_TCC'),
+        (libtcc_incdir, None, libtcc_is_header, identity_transform, 'GUM_CHEADER_TCC'),
         (gum_dir / ("arch-" + writer_arch), gum_dir.parent, gum_header_matches_writer, optimize_gum_header, 'GUM_CHEADER_FRIDA'),
         (capstone_incdir, None, capstone_header_matches_arch, optimize_capstone_header, 'GUM_CHEADER_FRIDA'),
     ]
@@ -283,6 +289,8 @@ def generate_runtime_cmodule(output_dir, output, arch, input_dir, gum_dir, capst
                 for pattern in (cmodule_function_pattern, cmodule_variable_pattern):
                     for m in pattern.finditer(header_source):
                         name = m.group(2)
+                        if name.startswith("cs_arch_register_"):
+                            continue
                         symbols.append(name)
 
                 source_bytes = bytearray(header_source.encode('utf-8'))
@@ -290,7 +298,7 @@ def generate_runtime_cmodule(output_dir, output, arch, input_dir, gum_dir, capst
                 source_size = len(source_bytes)
 
                 output_file.write("static const gchar {0}[{1}] =\n{{".format(input_identifier, source_size))
-                write_bytes(source_bytes, output_file)
+                write_bytes(source_bytes, output_file, 'signed')
                 output_file.write("\n};\n\n")
 
                 modules.append((header_name, input_identifier, source_size - 1, header_kind))
@@ -388,7 +396,7 @@ def to_canonical_source_path(path):
     return "frida/" + path
 
 
-def write_bytes(data, sink):
+def write_bytes(data, sink, encoding):
     sink.write("\n  ")
     line_length = 0
     offset = 0
@@ -399,6 +407,8 @@ def write_bytes(data, sink):
         if line_length >= 70:
             sink.write("\n  ")
             line_length = 0
+        if encoding == 'signed' and b >= 128:
+            b -= 256
         token = str(b)
         sink.write(token)
 

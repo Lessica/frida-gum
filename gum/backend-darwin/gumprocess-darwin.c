@@ -1,8 +1,9 @@
 /*
- * Copyright (C) 2010-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2010-2023 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2015 Asger Hautop Drewsen <asgerdrewsen@gmail.com>
  * Copyright (C) 2022 Francesco Tamagni <mrmacete@protonmail.ch>
  * Copyright (C) 2022 Håvard Sørbø <havard@hsorbo.no>
+ * Copyright (C) 2023 Alex Soler <asoler@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -222,6 +223,7 @@ struct _DyldImageInfo64
 #ifndef PROC_INFO_CALL_PIDINFO
 
 # define PROC_INFO_CALL_PIDINFO 0x2
+# define PROC_PIDREGIONINFO     7
 # define PROC_PIDREGIONPATHINFO 8
 
 struct vinfo_stat
@@ -334,8 +336,6 @@ static gboolean gum_module_path_equals (const gchar * path,
     const gchar * name_or_path);
 
 static GumThreadState gum_thread_state_from_darwin (integer_t run_state);
-G_GNUC_UNUSED static gboolean gum_darwin_is_unified_thread_state_valid (
-    const GumDarwinUnifiedThreadState * ts);
 
 static gboolean gum_darwin_fill_file_mapping (gint pid,
     mach_vm_address_t address, GumFileMapping * file,
@@ -424,84 +424,10 @@ beach:
 gboolean
 gum_process_modify_thread (GumThreadId thread_id,
                            GumModifyThreadFunc func,
-                           gpointer user_data)
+                           gpointer user_data,
+                           GumModifyThreadFlags flags)
 {
-#ifdef HAVE_WATCHOS
-  return FALSE;
-#else
-  gboolean success = FALSE;
-  mach_port_t task;
-  thread_act_array_t threads;
-  mach_msg_type_number_t count;
-  kern_return_t kr;
-
-  task = mach_task_self ();
-
-  kr = task_threads (task, &threads, &count);
-  if (kr == KERN_SUCCESS)
-  {
-    guint i;
-
-    for (i = 0; i != count; i++)
-    {
-      thread_t thread = threads[i];
-
-      if (thread == thread_id)
-      {
-        GumDarwinUnifiedThreadState state;
-        mach_msg_type_number_t state_count = GUM_DARWIN_THREAD_STATE_COUNT;
-        thread_state_flavor_t state_flavor = GUM_DARWIN_THREAD_STATE_FLAVOR;
-        GumCpuContext cpu_context;
-        gboolean state_is_valid = FALSE;
-        guint fail_count = 0;
-
-        do
-        {
-          kr = thread_suspend (thread);
-          if (kr != KERN_SUCCESS)
-            break;
-
-          kr = thread_get_state (thread, state_flavor, (thread_state_t) &state,
-              &state_count);
-          if (kr != KERN_SUCCESS)
-          {
-            thread_resume (thread);
-            break;
-          }
-
-          state_is_valid = gum_darwin_is_unified_thread_state_valid (&state);
-          if (!state_is_valid)
-          {
-            thread_resume (thread);
-            fail_count++;
-            if (fail_count < GUM_MAX_THREAD_POLL)
-              g_usleep (GUM_THREAD_POLL_STEP);
-          }
-        }
-        while (!state_is_valid && fail_count < GUM_MAX_THREAD_POLL);
-
-        if (kr != KERN_SUCCESS || fail_count >= GUM_MAX_THREAD_POLL)
-          break;
-
-        gum_darwin_parse_unified_thread_state (&state, &cpu_context);
-        func (thread_id, &cpu_context, user_data);
-        gum_darwin_unparse_unified_thread_state (&cpu_context, &state);
-
-        kr = thread_set_state (thread, state_flavor, (thread_state_t) &state,
-            state_count);
-
-        success =
-            (thread_resume (thread) == KERN_SUCCESS && kr == KERN_SUCCESS);
-      }
-    }
-
-    for (i = 0; i != count; i++)
-      mach_port_deallocate (task, threads[i]);
-    vm_deallocate (task, (vm_address_t) threads, count * sizeof (thread_t));
-  }
-
-  return success;
-#endif
+  return gum_darwin_modify_thread (thread_id, func, user_data, flags);
 }
 
 void
@@ -512,8 +438,8 @@ _gum_process_enumerate_threads (GumFoundThreadFunc func,
 }
 
 void
-gum_process_enumerate_modules (GumFoundModuleFunc func,
-                               gpointer user_data)
+_gum_process_enumerate_modules (GumFoundModuleFunc func,
+                                gpointer user_data)
 {
   gum_darwin_enumerate_modules (mach_task_self (), func, user_data);
 }
@@ -1060,9 +986,14 @@ gum_darwin_query_hardened (void)
   if (g_once_init_enter (&cached_result))
   {
     const gchar * program_path;
+    guint i;
     gboolean is_hardened;
 
-    program_path = _dyld_get_image_name (0);
+    for (program_path = NULL, i = 0; program_path == NULL; i++)
+    {
+      if (_dyld_get_image_header (i)->filetype == MH_EXECUTE)
+        program_path = _dyld_get_image_name (i);
+    }
 
     is_hardened = strcmp (program_path, "/sbin/launchd") == 0 ||
         g_str_has_prefix (program_path, "/usr/libexec/") ||
@@ -1222,6 +1153,29 @@ gum_darwin_query_mapped_address (mach_port_t task,
   mapping_offset = address - region.prp_prinfo.pri_address;
   details->offset = mapping_offset;
   details->size = region.prp_prinfo.pri_size - mapping_offset;
+
+  return TRUE;
+}
+
+gboolean
+gum_darwin_query_protection (mach_port_t task,
+                             GumAddress address,
+                             GumPageProtection * prot)
+{
+  kern_return_t kr;
+  gint pid, retval;
+  struct proc_regioninfo region;
+
+  kr = pid_for_task (task, &pid);
+  if (kr != KERN_SUCCESS)
+    return FALSE;
+
+  retval = __proc_info (PROC_INFO_CALL_PIDINFO, pid, PROC_PIDREGIONINFO,
+      address, &region, sizeof (struct proc_regioninfo));
+  if (retval == -1)
+    return FALSE;
+
+  *prot = gum_page_protection_from_mach (region.pri_protection);
 
   return TRUE;
 }
@@ -1410,6 +1364,67 @@ gum_probe_range_for_entrypoint (const GumRangeDetails * details,
 
   g_free (chunk);
   return carry_on;
+}
+
+gboolean
+gum_darwin_modify_thread (mach_port_t thread,
+                          GumModifyThreadFunc func,
+                          gpointer user_data,
+                          GumModifyThreadFlags flags)
+{
+#ifdef HAVE_WATCHOS
+  return FALSE;
+#else
+  kern_return_t kr;
+  gboolean is_suspended = FALSE;
+  GumDarwinUnifiedThreadState state;
+  mach_msg_type_number_t state_count = GUM_DARWIN_THREAD_STATE_COUNT;
+  thread_state_flavor_t state_flavor = GUM_DARWIN_THREAD_STATE_FLAVOR;
+  GumCpuContext cpu_context, original_cpu_context;
+
+  kr = thread_suspend (thread);
+  if (kr != KERN_SUCCESS)
+    goto beach;
+
+  is_suspended = TRUE;
+
+  if ((flags & GUM_MODIFY_THREAD_FLAGS_ABORT_SAFELY) != 0)
+  {
+    kr = thread_abort_safely (thread);
+    if (kr != KERN_SUCCESS)
+      goto beach;
+  }
+
+  kr = thread_get_state (thread, state_flavor, (thread_state_t) &state,
+      &state_count);
+  if (kr != KERN_SUCCESS)
+    goto beach;
+
+  gum_darwin_parse_unified_thread_state (&state, &cpu_context);
+  memcpy (&original_cpu_context, &cpu_context, sizeof (cpu_context));
+
+  func (thread, &cpu_context, user_data);
+
+  if (memcmp (&cpu_context, &original_cpu_context, sizeof (cpu_context)) != 0)
+  {
+    gum_darwin_unparse_unified_thread_state (&cpu_context, &state);
+
+    kr = thread_set_state (thread, state_flavor, (thread_state_t) &state,
+        state_count);
+  }
+
+beach:
+  if (is_suspended)
+  {
+    kern_return_t resume_res;
+
+    resume_res = thread_resume (thread);
+    if (kr == KERN_SUCCESS)
+      kr = resume_res;
+  }
+
+  return kr == KERN_SUCCESS;
+#endif
 }
 
 void
@@ -2412,21 +2427,6 @@ gum_darwin_parse_unified_thread_state (const GumDarwinUnifiedThreadState * ts,
   gum_darwin_parse_native_thread_state (&ts->ts_32, ctx);
 #elif defined (HAVE_ARM64)
   gum_darwin_parse_native_thread_state (&ts->ts_64, ctx);
-#endif
-}
-
-static gboolean
-gum_darwin_is_unified_thread_state_valid (
-    const GumDarwinUnifiedThreadState * ts)
-{
-#if defined (HAVE_I386) && GLIB_SIZEOF_VOID_P == 4
-  return ts->uts.ts32.__eip != 0;
-#elif defined (HAVE_I386) && GLIB_SIZEOF_VOID_P == 8
-  return ts->uts.ts64.__rip != 0;
-#elif defined (HAVE_ARM)
-  return ts->ts_32.__pc != 0;
-#elif defined (HAVE_ARM64)
-  return __darwin_arm_thread_state64_get_pc_fptr (ts->ts_64) != NULL;
 #endif
 }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2010-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2010-2023 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2015 Marc Hartmayer <hello@hartmayer.com>
  * Copyright (C) 2020-2021 Francesco Tamagni <mrmacete@protonmail.ch>
  * Copyright (C) 2020 Marcus Mengs <mame8282@googlemail.com>
@@ -42,6 +42,7 @@ TESTLIST_BEGIN (script)
 #endif
 
   TESTGROUP_BEGIN ("WeakRef")
+    TESTENTRY (weak_ref_api_should_be_supported)
     TESTENTRY (weak_callback_is_triggered_on_gc)
     TESTENTRY (weak_callback_is_triggered_on_unload)
     TESTENTRY (weak_callback_is_triggered_on_unbind)
@@ -82,6 +83,9 @@ TESTLIST_BEGIN (script)
     TESTENTRY (interceptor_should_support_native_pointer_values)
     TESTENTRY (interceptor_should_handle_bad_pointers)
     TESTENTRY (interceptor_should_refuse_to_attach_without_any_callbacks)
+#ifdef HAVE_DARWIN
+    TESTENTRY (interceptor_and_js_should_not_deadlock)
+#endif
   TESTGROUP_END ()
   TESTGROUP_BEGIN ("Interceptor/Performance")
     TESTENTRY (interceptor_on_enter_performance)
@@ -457,6 +461,12 @@ TESTLIST_BEGIN (script)
     TESTENTRY (dynamic_script_loaded_should_support_separate_source_map)
   TESTGROUP_END ()
 
+  TESTGROUP_BEGIN ("Worker")
+    TESTENTRY (worker_basics_should_be_supported)
+    TESTENTRY (worker_rpc_should_be_supported)
+    TESTENTRY (worker_termination_should_be_supported)
+  TESTGROUP_END ()
+
   TESTENTRY (script_can_be_compiled_to_bytecode)
   TESTENTRY (script_should_not_leak_if_destroyed_before_load)
   TESTENTRY (script_memory_usage)
@@ -563,6 +573,12 @@ static void on_incoming_debug_message (GumInspectorServer * server,
     const gchar * message, gpointer user_data);
 static void on_outgoing_debug_message (const gchar * message,
     gpointer user_data);
+
+#ifdef HAVE_DARWIN
+static gpointer interceptor_attacher_worker (gpointer data);
+static void empty_invocation_callback (GumInvocationContext * context,
+    gpointer user_data);
+#endif
 
 static int target_function_int (int arg);
 G_GNUC_UNUSED static float target_function_float (float arg);
@@ -4280,6 +4296,7 @@ TESTCASE (execution_can_be_traced_with_custom_transformer)
 
       "    while ((instruction = iterator.next()) !== null) {"
       "      if (instructionsSeen === 0) {"
+      "        send(typeof iterator.memoryAccess);"
       "        iterator.putCallout(onBeforeFirstInstruction);"
       "      }"
 
@@ -4303,6 +4320,7 @@ TESTCASE (execution_can_be_traced_with_custom_transformer)
       test_thread_id,
       test_thread_id);
   g_usleep (1);
+  EXPECT_SEND_MESSAGE_WITH ("\"string\"");
   EXPECT_NO_MESSAGES ();
 
   POST_MESSAGE ("{\"type\":\"stop\"}");
@@ -7083,6 +7101,92 @@ TESTCASE (interceptor_should_refuse_to_attach_without_any_callbacks)
       "Error: expected at least one callback");
 }
 
+#ifdef HAVE_DARWIN
+
+TESTCASE (interceptor_and_js_should_not_deadlock)
+{
+  GThread * worker_thread;
+  int state = 0;
+
+  if (!g_test_slow ())
+  {
+    g_print ("<skipping, run in slow mode> ");
+    return;
+  }
+
+  worker_thread = g_thread_new ("script-test-worker-thread",
+      interceptor_attacher_worker, &state);
+  while (state == 0)
+    g_usleep (G_USEC_PER_SEC / 200);
+
+  COMPILE_AND_LOAD_SCRIPT (
+      "const iterations = 100;"
+      "send('Start loop');"
+      "const threadSuspend = new NativeFunction("
+      "  Module.getExportByName(null, 'thread_suspend'),"
+      "  'int', ['int'], { scheduling: 'exclusive' }"
+      ");"
+      "Interceptor.replace(threadSuspend, new NativeCallback((threadId) => {"
+      "  return threadSuspend(threadId);"
+      "}, 'int', ['int']));"
+      "Interceptor.flush();"
+      "setTimeout(() => {"
+      "  for (let i = 0; i !== iterations; i++)"
+      "    Thread.sleep(0.1);"
+      "  Interceptor.revert(threadSuspend);"
+      "  send('The end');"
+      "}, 0);");
+
+  EXPECT_SEND_MESSAGE_WITH ("\"Start loop\"");
+
+  g_usleep (G_USEC_PER_SEC / 25);
+  g_thread_join (worker_thread);
+  g_assert_cmpint (state, ==, 2);
+  EXPECT_SEND_MESSAGE_WITH ("\"The end\"");
+  EXPECT_NO_MESSAGES ();
+}
+
+static gpointer
+interceptor_attacher_worker (gpointer data)
+{
+  int * state = data;
+  guint i;
+  GumInterceptor * interceptor;
+  GumInvocationListener * listener;
+  GumAttachReturn result;
+
+  *state = 1;
+
+  interceptor = gum_interceptor_obtain ();
+  listener = gum_make_call_listener (empty_invocation_callback,
+      empty_invocation_callback, NULL, NULL);
+
+  for (i = 0; i != 300; i++)
+  {
+    result = gum_interceptor_attach (interceptor, target_function_int,
+        GUM_INVOCATION_LISTENER (listener), NULL);
+    if (result == GUM_ATTACH_OK)
+    {
+      g_usleep (G_USEC_PER_SEC / 25);
+      gum_interceptor_detach (interceptor, GUM_INVOCATION_LISTENER (listener));
+    }
+  }
+
+  g_object_unref (listener);
+
+  *state = 2;
+
+  return NULL;
+}
+
+static void
+empty_invocation_callback (GumInvocationContext * context,
+                           gpointer user_data)
+{
+}
+
+#endif
+
 TESTCASE (interceptor_on_enter_performance)
 {
   COMPILE_AND_LOAD_SCRIPT (
@@ -8944,6 +9048,8 @@ TESTCASE (cmodule_can_be_used_with_stalker_transform)
       "           GumStalkerOutput * output,\\n"
       "           gpointer user_data)\\n"
       "{\\n"
+      "  GumMemoryAccess access =\\n"
+      "      gum_stalker_iterator_get_memory_access (iterator);\\n"
       "  printf (\"\\\\ntransform()\\\\n\");\\n"
       "  const cs_insn * insn = NULL;\\n"
       "  while (gum_stalker_iterator_next (iterator, &insn))\\n"
@@ -8963,15 +9069,21 @@ TESTCASE (cmodule_can_be_used_with_stalker_transform)
       "        gum_arm_writer_put_nop (output->writer.arm);\\n"
       "      else\\n"
       "        gum_thumb_writer_put_nop (output->writer.thumb);\\n"
-      "      gum_stalker_iterator_put_callout (iterator, on_ret, NULL,\\n"
-      "          NULL);\\n"
+      "      if (access == GUM_MEMORY_ACCESS_OPEN)\\n"
+      "      {\\n"
+      "        gum_stalker_iterator_put_callout (iterator, on_ret, NULL,\\n"
+      "            NULL);\\n"
+      "      }\\n"
       "    }\\n"
       "#elif defined (HAVE_ARM64)\\n"
       "    if (insn->id == ARM64_INS_RET)\\n"
       "    {\\n"
       "      gum_arm64_writer_put_nop (output->writer.arm64);\\n"
-      "      gum_stalker_iterator_put_callout (iterator, on_ret, NULL,\\n"
-      "          NULL);\\n"
+      "      if (access == GUM_MEMORY_ACCESS_OPEN)\\n"
+      "      {\\n"
+      "        gum_stalker_iterator_put_callout (iterator, on_ret, NULL,\\n"
+      "            NULL);\\n"
+      "      }\\n"
       "    }\\n"
       "#endif\\n"
       "    gum_stalker_iterator_keep (iterator);\\n"
@@ -10227,6 +10339,118 @@ TESTCASE (dynamic_script_loaded_should_support_separate_source_map)
   test_script_message_item_free (item);
 }
 
+TESTCASE (worker_basics_should_be_supported)
+{
+  if (!GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend))
+  {
+    g_print ("<only available on QuickJS for now> ");
+    return;
+  }
+
+  COMPILE_AND_LOAD_SCRIPT (
+      "📦\n"
+      "202 /main.js\n"
+      "126 /worker.js\n"
+      "92 /wrangler.js\n"
+      "✄\n"
+      "import { url as workerUrl } from './worker.js';\n"
+      "const w = new Worker(workerUrl, {\n"
+      "    onMessage(message) {\n"
+      "        send(`onMessage got: ${JSON.stringify(message)}`);\n"
+      "    }\n"
+      "});\n"
+      "w.post({ type: 'ping' });\n"
+      "\n"
+      "✄\n"
+      "import * as wrangler from './wrangler.js';\n"
+      "export const url = import.meta.url;\n"
+      "export function run() {\n"
+      "    wrangler.init();\n"
+      "}\n"
+      "\n"
+      "✄\n"
+      "export function init() {\n"
+      "    recv('ping', () => {\n"
+      "        send({ type: 'pong' });\n"
+      "    });\n"
+      "}\n");
+  EXPECT_SEND_MESSAGE_WITH ("\"onMessage got: {\\\"type\\\":\\\"pong\\\"}\"");
+  EXPECT_NO_MESSAGES ();
+}
+
+TESTCASE (worker_rpc_should_be_supported)
+{
+  if (!GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend))
+  {
+    g_print ("<only available on QuickJS for now> ");
+    return;
+  }
+
+  COMPILE_AND_LOAD_SCRIPT (
+      "📦\n"
+      "247 /main.js\n"
+      "101 /worker.js\n"
+      "✄\n"
+      "import { url as workerUrl } from './worker.js';\n"
+      "async function main() {\n"
+      "    try {\n"
+      "        const w = new Worker(workerUrl);\n"
+      "        send(await w.exports.add(2, 3));\n"
+      "    }\n"
+      "    catch (e) {\n"
+      "        Script.nextTick(() => { throw e; });\n"
+      "    }\n"
+      "}\n"
+      "main();\n"
+      "\n"
+      "✄\n"
+      "export const url = import.meta.url;\n"
+      "export function run() {\n"
+      "    rpc.exports.add = (a, b) => a + b;\n"
+      "}\n");
+  EXPECT_SEND_MESSAGE_WITH ("5");
+  EXPECT_NO_MESSAGES ();
+}
+
+TESTCASE (worker_termination_should_be_supported)
+{
+  if (!GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend))
+  {
+    g_print ("<only available on QuickJS for now> ");
+    return;
+  }
+
+  COMPILE_AND_LOAD_SCRIPT (
+      "📦\n"
+      "290 /main.js\n"
+      "221 /worker.js\n"
+      "✄\n"
+      "import { url as workerUrl } from './worker.js';\n"
+      "async function main() {\n"
+      "    try {\n"
+      "        const w = new Worker(workerUrl);\n"
+      "        setTimeout(() => { w.terminate(); }, 100);\n"
+      "        send(await w.exports.simulateSlowRequest());\n"
+      "    }\n"
+      "    catch (e) {\n"
+      "        send(e.message);\n"
+      "    }\n"
+      "}\n"
+      "main();\n"
+      "\n"
+      "✄\n"
+      "export const url = import.meta.url;\n"
+      "export function run() {\n"
+      "    rpc.exports.simulateSlowRequest = () => {\n"
+      "        return new Promise(resolve => {\n"
+      "            setTimeout(() => { resolve(42); }, 5000);\n"
+      "        });\n"
+      "    };\n"
+      "}\n");
+  EXPECT_SEND_MESSAGE_WITH ("\"worker terminated\"");
+  EXPECT_NO_MESSAGES ();
+}
+
 TESTCASE (source_maps_should_be_supported_for_our_runtime)
 {
   TestScriptMessageItem * item;
@@ -10411,6 +10635,24 @@ TESTCASE (types_handle_invalid_construction)
   EXPECT_SEND_MESSAGE_WITH (GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend)
       ? "\"must be called with new\""
       : "\"use `new File()` to create a new instance\"");
+}
+
+TESTCASE (weak_ref_api_should_be_supported)
+{
+  COMPILE_AND_LOAD_SCRIPT (
+      "let r = null;"
+      "(() => {"
+      "  const val = { name: 'Joe' };"
+      "  r = new WeakRef(val);"
+      "  send(r.deref() === val);"
+      "})();"
+      "setImmediate(() => {"
+      "  gc();"
+      "  send(typeof r.deref());"
+      "});");
+  EXPECT_SEND_MESSAGE_WITH ("true");
+  EXPECT_SEND_MESSAGE_WITH ("\"undefined\"");
+  EXPECT_NO_MESSAGES ();
 }
 
 TESTCASE (weak_callback_is_triggered_on_gc)

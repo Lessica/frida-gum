@@ -345,7 +345,7 @@ verify_module_bounds (const GumModuleDetails * details,
     return TRUE;
 
   g_assert_cmphex (range->base_address, ==, bounds->start);
-  g_assert_cmphex (range->base_address + range->size, ==, bounds->end);
+  g_assert_cmphex (range->base_address + range->size, >=, bounds->end);
 
   return TRUE;
 }
@@ -735,7 +735,6 @@ TESTCASE (module_exports)
 
 TESTCASE (module_symbols)
 {
-#ifndef HAVE_WINDOWS
   TestForEachContext ctx;
 
   ctx.number_of_calls = 0;
@@ -747,9 +746,6 @@ TESTCASE (module_symbols)
   ctx.value_to_return = FALSE;
   gum_module_enumerate_symbols (GUM_TESTS_MODULE_NAME, symbol_found_cb, &ctx);
   g_assert_cmpuint (ctx.number_of_calls, ==, 1);
-#else
-  (void) symbol_found_cb;
-#endif
 }
 
 TESTCASE (module_ranges_can_be_enumerated)

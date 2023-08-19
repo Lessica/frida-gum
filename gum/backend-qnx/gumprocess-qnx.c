@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2015-2023 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -160,7 +160,8 @@ beach:
 gboolean
 gum_process_modify_thread (GumThreadId thread_id,
                            GumModifyThreadFunc func,
-                           gpointer user_data)
+                           gpointer user_data,
+                           GumModifyThreadFlags flags)
 {
   gboolean success = FALSE;
   gboolean holding = FALSE;
@@ -242,7 +243,7 @@ _gum_process_enumerate_threads (GumFoundThreadFunc func,
 
     if (thread.state != STATE_DEAD &&
         gum_process_modify_thread (details.id, gum_store_cpu_context,
-          &details.cpu_context))
+          &details.cpu_context, GUM_MODIFY_THREAD_FLAGS_ABORT_SAFELY))
     {
       carry_on = func (&details, user_data);
     }
@@ -262,8 +263,8 @@ gum_store_cpu_context (GumThreadId thread_id,
 }
 
 void
-gum_process_enumerate_modules (GumFoundModuleFunc func,
-                               gpointer user_data)
+_gum_process_enumerate_modules (GumFoundModuleFunc func,
+                                gpointer user_data)
 {
   GumQnxListHead * handle;
   GumQnxListHead * cur;

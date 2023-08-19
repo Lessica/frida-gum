@@ -1,7 +1,8 @@
 /*
- * Copyright (C) 2014-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2014-2023 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2017 Antonio Ken Iannillo <ak.iannillo@gmail.com>
  * Copyright (C) 2019 John Coates <john@johncoates.dev>
+ * Copyright (C) 2023 Håvard Sørbø <havard@hsorbo.no>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -43,6 +44,7 @@
 #define GUM_STACK_ALIGNMENT                16
 #define GUM_INVALIDATE_TRAMPOLINE_MAX_SIZE 40
 #define GUM_RESTORATION_PROLOG_SIZE        4
+#define GUM_EXCLUSIVE_ACCESS_MAX_DEPTH     8
 
 #define GUM_IC_MAGIC_EMPTY                 0xbaadd00ddeadface
 
@@ -297,7 +299,10 @@ struct _GumExecBlock
 
 enum _GumExecBlockFlags
 {
-  GUM_EXEC_BLOCK_ACTIVATION_TARGET = 1 << 0,
+  GUM_EXEC_BLOCK_ACTIVATION_TARGET     = 1 << 0,
+  GUM_EXEC_BLOCK_HAS_EXCLUSIVE_LOAD    = 1 << 1,
+  GUM_EXEC_BLOCK_HAS_EXCLUSIVE_STORE   = 1 << 2,
+  GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS = 1 << 3,
 };
 
 struct _GumSlab
@@ -349,7 +354,6 @@ struct _GumGeneratorContext
   GumArm64Writer * slow_writer;
   gpointer continuation_real_address;
   GumPrologType opened_prolog;
-  gint exclusive_load_offset;
 };
 
 struct _GumInstruction
@@ -402,7 +406,6 @@ enum _GumVirtualizationRequirements
 {
   GUM_REQUIRE_NOTHING          = 0,
   GUM_REQUIRE_RELOCATION       = 1 << 0,
-  GUM_REQUIRE_EXCLUSIVE_STORE  = 1 << 1,
 };
 
 enum _GumBackpatchType
@@ -690,6 +693,10 @@ static void gum_exec_block_write_slab_transfer_code (GumArm64Writer * from,
     GumArm64Writer * to);
 static void gum_exec_block_backpatch_slab (GumExecBlock * block,
     gpointer target);
+static void gum_exec_block_maybe_inherit_exclusive_access_state (
+    GumExecBlock * block, GumExecBlock * reference);
+static void gum_exec_block_propagate_exclusive_access_state (
+    GumExecBlock * block);
 static void gum_exec_ctx_write_adjust_depth (GumExecCtx * ctx,
     GumArm64Writer * cw, gssize adj);
 static arm64_reg gum_exec_block_write_inline_cache_code (
@@ -1329,7 +1336,8 @@ gum_stalker_follow (GumStalker * self,
     ctx.transformer = transformer;
     ctx.sink = sink;
 
-    gum_process_modify_thread (thread_id, gum_stalker_infect, &ctx);
+    gum_process_modify_thread (thread_id, gum_stalker_infect, &ctx,
+        GUM_MODIFY_THREAD_FLAGS_NONE);
   }
 }
 
@@ -1360,7 +1368,8 @@ gum_stalker_unfollow (GumStalker * self,
       dc.exec_ctx = ctx;
       dc.success = FALSE;
 
-      gum_process_modify_thread (thread_id, gum_stalker_disinfect, &dc);
+      gum_process_modify_thread (thread_id, gum_stalker_disinfect, &dc,
+          GUM_MODIFY_THREAD_FLAGS_NONE);
 
       if (dc.success)
         gum_stalker_destroy_exec_ctx (self, ctx);
@@ -1752,7 +1761,8 @@ gum_stalker_do_invalidate (GumExecCtx * ctx,
     else
     {
       gum_process_modify_thread (ctx->thread_id,
-          gum_stalker_try_invalidate_block_owned_by_thread, &ic);
+          gum_stalker_try_invalidate_block_owned_by_thread, &ic,
+          GUM_MODIFY_THREAD_FLAGS_NONE);
     }
   }
 
@@ -2123,8 +2133,6 @@ gum_exec_ctx_new (GumStalker * stalker,
   ctx->mappings = gum_metal_hash_table_new (NULL, NULL);
 
   gum_exec_ctx_ensure_inline_helpers_reachable (ctx);
-
-  code_slab->invalidator = ctx->last_invalidator;
 
   ctx->depth = 0;
 
@@ -2527,10 +2535,12 @@ gum_exec_ctx_obtain_block_for (GumExecCtx * ctx,
   {
     block = gum_exec_block_new (ctx);
     block->real_start = real_address;
+    gum_exec_block_maybe_inherit_exclusive_access_state (block, block->next);
     gum_exec_ctx_compile_block (ctx, block, real_address, block->code_start,
         GUM_ADDRESS (block->code_start), &block->real_size, &block->code_size,
         &block->slow_size);
     gum_exec_block_commit (block);
+    gum_exec_block_propagate_exclusive_access_state (block);
 
     gum_metal_hash_table_insert (ctx->mappings, real_address, block);
 
@@ -2665,6 +2675,7 @@ gum_exec_ctx_write_scratch_slab (GumExecCtx * ctx,
   block->slow_slab = ctx->slow_slab;
   block->slow_start = gum_slab_cursor (&slow_slab->slab);
   scratch_base = ctx->scratch_slab->slab.data;
+  ctx->scratch_slab->invalidator = prev_code_slab->invalidator;
 
   gum_exec_ctx_compile_block (ctx, block, block->real_start, scratch_base,
       GUM_ADDRESS (internal_code), input_size, output_size, slow_size);
@@ -2710,7 +2721,6 @@ gum_exec_ctx_compile_block (GumExecCtx * ctx,
   gc.slow_writer = cws;
   gc.continuation_real_address = NULL;
   gc.opened_prolog = GUM_PROLOG_NONE;
-  gc.exclusive_load_offset = GUM_INSTRUCTION_OFFSET_NONE;
 
   iterator.exec_context = ctx;
   iterator.exec_block = block;
@@ -2802,33 +2812,9 @@ gum_stalker_iterator_next (GumStalkerIterator * self,
       gc->continuation_real_address = instruction->end;
       return FALSE;
     }
-    else if ((self->requirements & GUM_REQUIRE_EXCLUSIVE_STORE) == 0 &&
-        gum_arm64_relocator_eob (rl))
+    else if (gum_arm64_relocator_eob (rl))
     {
       return FALSE;
-    }
-
-    switch (instruction->ci->id)
-    {
-      case ARM64_INS_STXR:
-      case ARM64_INS_STXP:
-      case ARM64_INS_STXRB:
-      case ARM64_INS_STXRH:
-      case ARM64_INS_STLXR:
-      case ARM64_INS_STLXP:
-      case ARM64_INS_STLXRB:
-      case ARM64_INS_STLXRH:
-        gc->exclusive_load_offset = GUM_INSTRUCTION_OFFSET_NONE;
-        break;
-      default:
-        break;
-    }
-
-    if (gc->exclusive_load_offset != GUM_INSTRUCTION_OFFSET_NONE)
-    {
-      gc->exclusive_load_offset++;
-      if (gc->exclusive_load_offset == 4)
-        gc->exclusive_load_offset = GUM_INSTRUCTION_OFFSET_NONE;
     }
   }
 
@@ -2893,14 +2879,24 @@ gum_stalker_iterator_keep (GumStalkerIterator * self)
     case ARM64_INS_LDXP:
     case ARM64_INS_LDXRB:
     case ARM64_INS_LDXRH:
-      gc->exclusive_load_offset = 0;
+      block->flags |= GUM_EXEC_BLOCK_HAS_EXCLUSIVE_LOAD;
+      break;
+    case ARM64_INS_STXR:
+    case ARM64_INS_STXP:
+    case ARM64_INS_STXRB:
+    case ARM64_INS_STXRH:
+    case ARM64_INS_STLXR:
+    case ARM64_INS_STLXP:
+    case ARM64_INS_STLXRB:
+    case ARM64_INS_STLXRH:
+      block->flags |= GUM_EXEC_BLOCK_HAS_EXCLUSIVE_STORE;
       break;
     default:
       break;
   }
 
   if ((self->exec_context->sink_mask & GUM_EXEC) != 0 &&
-      gc->exclusive_load_offset == GUM_INSTRUCTION_OFFSET_NONE)
+      (block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) == 0)
   {
     gum_exec_block_write_exec_event_code (block, gc, GUM_CODE_INTERRUPTIBLE);
   }
@@ -2947,6 +2943,14 @@ gum_stalker_iterator_keep (GumStalkerIterator * self)
     gum_arm64_relocator_write_one (rl);
 
   self->requirements = requirements;
+}
+
+GumMemoryAccess
+gum_stalker_iterator_get_memory_access (GumStalkerIterator * self)
+{
+  return ((self->exec_block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) != 0)
+      ? GUM_MEMORY_ACCESS_EXCLUSIVE
+      : GUM_MEMORY_ACCESS_OPEN;
 }
 
 static void
@@ -3068,6 +3072,12 @@ gum_stalker_invoke_callout (GumCalloutEntry * entry,
   ec->pending_calls--;
 }
 
+csh
+gum_stalker_iterator_get_capstone (GumStalkerIterator * self)
+{
+  return self->exec_context->relocator.capstone;
+}
+
 /*
  * Note that as well as providing a GumArm64Writer to the functions for writing
  * a prolog or epilog, we must also provide a parameter indicating whether it is
@@ -3131,6 +3141,8 @@ gum_exec_ctx_ensure_inline_helpers_reachable (GumExecCtx * ctx)
 
   gum_exec_ctx_ensure_helper_reachable (ctx, code_slab, slow_slab, cw,
       &ctx->last_invalidator, gum_exec_ctx_write_invalidator);
+  ctx->code_slab->invalidator = ctx->last_invalidator;
+  ctx->slow_slab->invalidator = ctx->last_invalidator;
 }
 
 static void
@@ -4372,15 +4384,8 @@ gum_exec_block_virtualize_branch_insn (GumExecBlock * block,
 
         gum_arm64_writer_put_label (cw, is_false);
 
-        if (gc->exclusive_load_offset == GUM_INSTRUCTION_OFFSET_NONE)
-        {
-          gum_exec_block_write_jmp_transfer_code (block, &cond_target,
-              cond_entry_func, gc);
-        }
-        else
-        {
-          return GUM_REQUIRE_EXCLUSIVE_STORE;
-        }
+        gum_exec_block_write_jmp_transfer_code (block, &cond_target,
+            cond_entry_func, gc);
       }
 
       break;
@@ -5191,6 +5196,63 @@ gum_exec_block_backpatch_slab (GumExecBlock * block,
 }
 
 static void
+gum_exec_block_maybe_inherit_exclusive_access_state (GumExecBlock * block,
+                                                     GumExecBlock * reference)
+{
+  const guint8 * real_address = block->real_start;
+  GumExecBlock * cur;
+
+  for (cur = reference; cur != NULL; cur = cur->next)
+  {
+    if ((cur->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) == 0)
+      return;
+
+    if (real_address >= cur->real_start &&
+        real_address < cur->real_start + cur->real_size)
+    {
+      block->flags |= GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS;
+      return;
+    }
+  }
+}
+
+static void
+gum_exec_block_propagate_exclusive_access_state (GumExecBlock * block)
+{
+  GumExecBlock * block_containing_load, * cur;
+  guint i;
+
+  if ((block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) != 0)
+    return;
+
+  if ((block->flags & GUM_EXEC_BLOCK_HAS_EXCLUSIVE_STORE) == 0)
+    return;
+
+  block_containing_load = NULL;
+  for (cur = block, i = 0;
+      cur != NULL && i != GUM_EXCLUSIVE_ACCESS_MAX_DEPTH;
+      cur = cur->next, i++)
+  {
+    if ((cur->flags & GUM_EXEC_BLOCK_HAS_EXCLUSIVE_LOAD) != 0)
+    {
+      block_containing_load = cur;
+      break;
+    }
+  }
+  if (block_containing_load == NULL)
+    return;
+
+  for (cur = block; TRUE; cur = cur->next)
+  {
+    cur->flags |= GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS;
+    gum_exec_block_invalidate (cur);
+
+    if (cur == block_containing_load)
+      break;
+  }
+}
+
+static void
 gum_exec_ctx_write_adjust_depth (GumExecCtx * ctx,
                                  GumArm64Writer * cw,
                                  gssize adj)
@@ -5259,7 +5321,7 @@ gum_exec_block_write_inline_cache_code (GumExecBlock * block,
 
   gum_arm64_writer_put_push_reg_reg (cw, ARM64_REG_X0, ARM64_REG_X1);
 
-  if (ARM64_REG_X16 != target_reg)
+  if (target_reg != ARM64_REG_X16)
     gum_arm64_writer_put_mov_reg_reg (cw, ARM64_REG_X16, target_reg);
 
   if ((stalker->cpu_features & GUM_CPU_PTRAUTH) != 0)

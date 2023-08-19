@@ -1,12 +1,14 @@
 /*
- * Copyright (C) 2009-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2009-2023 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
 #include "gumprocess-priv.h"
 
+#define _NO_CVCONST_H
 #include "gumwindows.h"
+#include "backend-dbghelp/gumdbghelp.h"
 
 #include <intrin.h>
 #include <psapi.h>
@@ -15,7 +17,14 @@
 
 typedef void (WINAPI * GumGetCurrentThreadStackLimitsFunc) (
     PULONG_PTR low_limit, PULONG_PTR high_limit);
+typedef struct _GumEnumerateSymbolsContext GumEnumerateSymbolsContext;
 typedef struct _GumFindExportContext GumFindExportContext;
+
+struct _GumEnumerateSymbolsContext
+{
+  GumFoundSymbolFunc func;
+  gpointer user_data;
+};
 
 struct _GumFindExportContext
 {
@@ -27,6 +36,8 @@ static gboolean gum_windows_get_thread_details (DWORD thread_id,
     GumThreadDetails * details);
 static gboolean gum_process_enumerate_heap_ranges (HANDLE heap,
     GumFoundMallocRangeFunc func, gpointer user_data);
+static BOOL CALLBACK gum_emit_symbol (PSYMBOL_INFO info, ULONG symbol_size,
+    PVOID user_context);
 static gboolean gum_store_address_if_module_has_export (
     const GumModuleDetails * details, gpointer user_data);
 static gboolean gum_store_address_if_export_name_matches (
@@ -97,7 +108,8 @@ gum_process_has_thread (GumThreadId thread_id)
 gboolean
 gum_process_modify_thread (GumThreadId thread_id,
                            GumModifyThreadFunc func,
-                           gpointer user_data)
+                           gpointer user_data,
+                           GumModifyThreadFlags flags)
 {
   gboolean success = FALSE;
   HANDLE thread;
@@ -244,8 +256,8 @@ gum_windows_get_thread_details (DWORD thread_id,
 }
 
 void
-gum_process_enumerate_modules (GumFoundModuleFunc func,
-                               gpointer user_data)
+_gum_process_enumerate_modules (GumFoundModuleFunc func,
+                                gpointer user_data)
 {
   HANDLE this_process;
   HMODULE first_module;
@@ -719,7 +731,56 @@ gum_module_enumerate_symbols (const gchar * module_name,
                               GumFoundSymbolFunc func,
                               gpointer user_data)
 {
-  /* TODO: implement */
+  GumDbghelpImpl * dbghelp;
+  HMODULE module;
+  GumEnumerateSymbolsContext ctx;
+
+  dbghelp = gum_dbghelp_impl_try_obtain ();
+  if (dbghelp == NULL)
+    return;
+
+  module = get_module_handle_utf8 (module_name);
+  if (module == NULL)
+    return;
+
+  ctx.func = func;
+  ctx.user_data = user_data;
+  dbghelp->SymEnumSymbols (GetCurrentProcess (), (ULONG64) module, NULL,
+      gum_emit_symbol, &ctx);
+}
+
+static BOOL CALLBACK
+gum_emit_symbol (PSYMBOL_INFO info,
+                 ULONG symbol_size,
+                 PVOID user_context)
+{
+  GumEnumerateSymbolsContext * ctx = user_context;
+  GumSymbolDetails details;
+
+  details.is_global = info->Tag == SymTagPublicSymbol ||
+      (info->Flags & SYMFLAG_EXPORT) != 0;
+
+  if (info->Tag == SymTagPublicSymbol || info->Tag == SymTagFunction)
+  {
+    details.type = GUM_SYMBOL_FUNCTION;
+  }
+  else if (info->Tag == SymTagData)
+  {
+    details.type = ((info->Flags & SYMFLAG_TLSREL) != 0)
+        ? GUM_SYMBOL_TLS
+        : GUM_SYMBOL_OBJECT;
+  }
+  else
+  {
+    return TRUE;
+  }
+
+  details.section = NULL;
+  details.name = info->Name;
+  details.address = info->Address;
+  details.size = symbol_size;
+
+  return ctx->func (&details, ctx->user_data);
 }
 
 void
@@ -728,10 +789,12 @@ gum_module_enumerate_ranges (const gchar * module_name,
                              GumFoundRangeFunc func,
                              gpointer user_data)
 {
-  HANDLE this_process = GetCurrentProcess ();
+  HANDLE this_process;
   HMODULE module;
   MODULEINFO mi;
   guint8 * cur_base_address, * end_address;
+
+  this_process = GetCurrentProcess ();
 
   module = get_module_handle_utf8 (module_name);
   if (module == NULL)

@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2015-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2023 Alex Soler <asoler@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -568,7 +569,7 @@ gum_kernel_store_kext_name (GumAddress address,
 
   /* Reference: osfmk/mach/kmod.h */
   buf = gum_kernel_read (address + 0x8c, 8, NULL);
-  kext = g_hash_table_lookup (ctx->kexts, *((GumAddress**)buf));
+  kext = g_hash_table_lookup (ctx->kexts, *((GumAddress **) buf));
   g_free (buf);
 
   if (kext == NULL)
@@ -633,7 +634,6 @@ gum_kernel_kext_by_name (GumDarwinModule * module,
 
   return !ctx->found;
 }
-
 
 static gboolean
 gum_kernel_emit_module_range (const GumDarwinSectionDetails * section,
@@ -906,9 +906,13 @@ gum_kernel_get_task (void)
 static mach_port_t
 gum_kernel_do_init (void)
 {
-#ifdef HAVE_IOS
-  mach_port_t task = MACH_PORT_NULL;
+#if defined (HAVE_IOS) || defined (HAVE_TVOS)
+  mach_port_t task;
 
+  if (gum_darwin_query_hardened ())
+    return MACH_PORT_NULL;
+
+  task = MACH_PORT_NULL;
   task_for_pid (mach_task_self (), 0, &task);
   if (task == MACH_PORT_NULL)
   {

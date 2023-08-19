@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2009-2023 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2010-2013 Karl Trygve Kalleberg <karltk@boblycat.org>
  * Copyright (C) 2020      Duy Phan Thanh <phanthanhduypr@gmail.com>
  *
@@ -1495,7 +1495,8 @@ gum_stalker_follow (GumStalker * self,
     ctx.transformer = transformer;
     ctx.sink = sink;
 
-    gum_process_modify_thread (thread_id, gum_stalker_infect, &ctx);
+    gum_process_modify_thread (thread_id, gum_stalker_infect, &ctx,
+        GUM_MODIFY_THREAD_FLAGS_NONE);
   }
 }
 
@@ -1526,7 +1527,8 @@ gum_stalker_unfollow (GumStalker * self,
       dc.exec_ctx = ctx;
       dc.success = FALSE;
 
-      gum_process_modify_thread (thread_id, gum_stalker_disinfect, &dc);
+      gum_process_modify_thread (thread_id, gum_stalker_disinfect, &dc,
+          GUM_MODIFY_THREAD_FLAGS_NONE);
 
       if (dc.success)
         gum_stalker_destroy_exec_ctx (self, ctx);
@@ -2005,7 +2007,8 @@ gum_stalker_do_invalidate (GumExecCtx * ctx,
     else
     {
       gum_process_modify_thread (ctx->thread_id,
-          gum_stalker_try_invalidate_block_owned_by_thread, &ic);
+          gum_stalker_try_invalidate_block_owned_by_thread, &ic,
+          GUM_MODIFY_THREAD_FLAGS_NONE);
     }
   }
 
@@ -2363,8 +2366,6 @@ gum_exec_ctx_new (GumStalker * stalker,
   ctx->mappings = gum_metal_hash_table_new (NULL, NULL);
 
   gum_exec_ctx_ensure_inline_helpers_reachable (ctx);
-
-  code_slab->invalidator = ctx->last_invalidator;
 
   ctx->depth = 0;
 
@@ -2885,6 +2886,7 @@ gum_exec_ctx_recompile_block (GumExecCtx * ctx,
   block->code_slab = ctx->scratch_slab;
   block->slow_slab = ctx->slow_slab;
   scratch_base = ctx->scratch_slab->slab.data;
+  ctx->scratch_slab->invalidator = slab->invalidator;
 
   gum_exec_ctx_compile_block (ctx, block, block->real_start, scratch_base,
       GUM_ADDRESS (internal_code), &input_size, &output_size, &slow_size);
@@ -3164,6 +3166,12 @@ gum_stalker_iterator_keep (GumStalkerIterator * self)
   self->requirements = requirements;
 }
 
+GumMemoryAccess
+gum_stalker_iterator_get_memory_access (GumStalkerIterator * self)
+{
+  return GUM_MEMORY_ACCESS_OPEN;
+}
+
 static void
 gum_exec_ctx_emit_call_event (GumExecCtx * ctx,
                               gpointer location,
@@ -3282,6 +3290,12 @@ gum_stalker_invoke_callout (GumCalloutEntry * entry,
   ec->pending_calls--;
 }
 
+csh
+gum_stalker_iterator_get_capstone (GumStalkerIterator * self)
+{
+  return self->exec_context->relocator.capstone;
+}
+
 static void
 gum_exec_ctx_write_prolog (GumExecCtx * ctx,
                            GumPrologType type,
@@ -3389,6 +3403,7 @@ gum_exec_ctx_ensure_inline_helpers_reachable (GumExecCtx * ctx)
 
   gum_exec_ctx_ensure_helper_reachable (ctx, &ctx->last_invalidator,
       gum_exec_ctx_write_invalidator);
+  ctx->code_slab->invalidator = ctx->last_invalidator;
 
 #ifdef HAVE_LINUX
   gum_exec_ctx_ensure_helper_reachable (ctx, &ctx->last_int80,

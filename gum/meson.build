@@ -10,6 +10,7 @@ gum_headers = [
   'gumdarwingrafter.h',
   'gumdarwinmodule.h',
   'gumdefs.h',
+  'gumelfmodule.h',
   'gumevent.h',
   'gumeventsink.h',
   'gumexceptor.h',
@@ -46,6 +47,7 @@ gum_sources = [
   'gumcodesegment.c',
   'gumdarwingrafter.c',
   'gumdarwinmodule.c',
+  'gumelfmodule.c',
   'gumexceptor.c',
   'gumeventsink.c',
   'gumheapapi.c',
@@ -125,7 +127,7 @@ if host_os_family == 'darwin'
     'backend-darwin/gumdarwinmapper.c',
     'backend-darwin/gumdarwinmoduleresolver.c',
   ]
-  if host_os in ['macos', 'ios']
+  if host_os in ['macos', 'ios', 'tvos']
     gum_sources += 'backend-darwin/gumexceptor-darwin.c'
     if have_jailbreak
       gum_sources += [
@@ -189,12 +191,8 @@ if host_os_family == 'qnx'
 endif
 
 if host_executable_format == 'elf'
-  gum_headers += [
-    'backend-elf/gumelfmodule.h',
-  ]
   gum_sources += [
     'backend-elf/gumprocess-elf.c',
-    'backend-elf/gumelfmodule.c',
   ]
 endif
 
